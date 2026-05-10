@@ -14,19 +14,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: ./.github/actions/publish-package
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-          cache: pnpm
-      - run: npm install -g npm@11.5.1 && npm --version
-      - run: pnpm install --frozen-lockfile
-      - name: Verify release tag matches package version
-        run: |
-          VERSION="agent-todos-v$(node -p "require('./packages/todos/package.json').version")"
-          if [ "$GITHUB_REF_NAME" != "$VERSION" ]; then echo "Tag $GITHUB_REF_NAME does not match $VERSION" >&2; exit 1; fi
-      - run: pnpm --filter @catdaemon/pi-agent-todos run typecheck
-      - run: pnpm --filter @catdaemon/pi-agent-todos test
-      - run: pnpm --filter @catdaemon/pi-agent-todos run pack:dry-run
-      - run: cd packages/todos && npm publish --provenance --access public
+          package-dir: packages/todos
+          package-name: @catdaemon/pi-agent-todos
+          tag-prefix: agent-todos-v

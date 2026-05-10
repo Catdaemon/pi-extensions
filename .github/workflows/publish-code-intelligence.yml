@@ -14,19 +14,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: ./.github/actions/publish-package
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-          cache: pnpm
-      - run: npm install -g npm@11.5.1 && npm --version
-      - run: pnpm install --frozen-lockfile
-      - name: Verify release tag matches package version
-        run: |
-          VERSION="code-intelligence-v$(node -p "require('./packages/code-intelligence/package.json').version")"
-          if [ "$GITHUB_REF_NAME" != "$VERSION" ]; then echo "Tag $GITHUB_REF_NAME does not match $VERSION" >&2; exit 1; fi
-      - run: pnpm --filter @catdaemon/pi-code-intelligence run typecheck
-      - run: pnpm --filter @catdaemon/pi-code-intelligence test
-      - run: pnpm --filter @catdaemon/pi-code-intelligence run pack:dry-run
-      - run: cd packages/code-intelligence && npm publish --provenance --access public
+          package-dir: packages/code-intelligence
+          package-name: @catdaemon/pi-code-intelligence
+          tag-prefix: code-intelligence-v

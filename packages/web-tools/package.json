@@ -1,6 +1,6 @@
 {
   "name": "@catdaemon/pi-web-tools",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Web search and fetch tools for Pi.",
   "type": "module",
   "keywords": ["pi-package", "pi", "web-search", "web-fetch", "exa"],

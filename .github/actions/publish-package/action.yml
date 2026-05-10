@@ -1,0 +1,41 @@
+name: Publish package
+
+description: Shared trusted-publishing steps for a Pi extension package.
+
+inputs:
+  package-dir:
+    description: Package directory relative to repository root.
+    required: true
+  package-name:
+    description: npm package name used by pnpm --filter.
+    required: true
+  tag-prefix:
+    description: Release tag prefix, excluding the package version.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        registry-url: https://registry.npmjs.org
+        cache: pnpm
+    - shell: bash
+      run: npm install -g npm@11.5.1 && npm --version
+    - shell: bash
+      run: pnpm install --frozen-lockfile
+    - name: Verify release tag matches package version
+      shell: bash
+      run: |
+        VERSION="${{ inputs.tag-prefix }}$(node -p "require('./${{ inputs.package-dir }}/package.json').version")"
+        if [ "$GITHUB_REF_NAME" != "$VERSION" ]; then echo "Tag $GITHUB_REF_NAME does not match $VERSION" >&2; exit 1; fi
+    - shell: bash
+      run: pnpm --filter "${{ inputs.package-name }}" run typecheck
+    - shell: bash
+      run: pnpm --filter "${{ inputs.package-name }}" test
+    - shell: bash
+      run: pnpm --filter "${{ inputs.package-name }}" run pack:dry-run
+    - shell: bash
+      run: cd "${{ inputs.package-dir }}" && npm publish --provenance --access public
