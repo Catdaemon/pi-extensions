@@ -1,6 +1,6 @@
 {
   "name": "@catdaemon/pi-agent-todos",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Conversation todo tools, prompt guidance, and status sidebar for Pi.",
   "type": "module",
   "keywords": ["pi-package", "pi", "todos", "agent-tools"],
