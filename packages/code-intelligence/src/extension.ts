@@ -669,11 +669,15 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
       const task = args.trim()
       let contextPack
       let warning
-      const resolvedRuntime = await ensureRuntimeForCwd(ctx.cwd, ctx)
-      if (resolvedRuntime.runtime && task) {
-        contextPack = await retrievePlanningContextPack(resolvedRuntime.runtime, task)
-      } else {
-        warning = resolvedRuntime.warning
+      try {
+        const resolvedRuntime = await ensureRuntimeForCwd(ctx.cwd, ctx)
+        if (resolvedRuntime.runtime && task) {
+          contextPack = await retrievePlanningContextPack(resolvedRuntime.runtime, task)
+        } else {
+          warning = resolvedRuntime.warning
+        }
+      } catch (error) {
+        warning = error instanceof Error ? error.message : String(error)
       }
       const prompt = buildPlanCommandPrompt({ task, contextPack, warning })
       if (ctx.hasUI) ctx.ui.notify('Plan mode queued. The agent will research, interview, and produce an implementation prompt.', 'info')
