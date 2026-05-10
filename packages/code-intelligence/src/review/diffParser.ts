@@ -9,6 +9,7 @@ export type ParsedDiffFile = {
   oldPath?: string
   addedLines: string[]
   deletedLines: string[]
+  diffLines: Array<{ kind: 'added' | 'deleted' | 'context'; text: string }>
 }
 
 export function parseUnifiedDiff(diff: string): ParsedDiff {
@@ -18,7 +19,7 @@ export function parseUnifiedDiff(diff: string): ParsedDiff {
   for (const line of diff.split('\n')) {
     const fileMatch = /^diff --git a\/(.+?) b\/(.+)$/.exec(line)
     if (fileMatch) {
-      current = { oldPath: fileMatch[1], path: fileMatch[2] ?? fileMatch[1] ?? '', addedLines: [], deletedLines: [] }
+      current = { oldPath: fileMatch[1], path: fileMatch[2] ?? fileMatch[1] ?? '', addedLines: [], deletedLines: [], diffLines: [] }
       files.push(current)
       continue
     }
@@ -32,9 +33,18 @@ export function parseUnifiedDiff(diff: string): ParsedDiff {
       current.oldPath = line.slice('--- a/'.length)
       continue
     }
-    if (line.startsWith('+++') || line.startsWith('---')) continue
-    if (line.startsWith('+')) current.addedLines.push(line.slice(1))
-    else if (line.startsWith('-')) current.deletedLines.push(line.slice(1))
+    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) continue
+    if (line.startsWith('+')) {
+      const text = line.slice(1)
+      current.addedLines.push(text)
+      current.diffLines.push({ kind: 'added', text })
+    } else if (line.startsWith('-')) {
+      const text = line.slice(1)
+      current.deletedLines.push(text)
+      current.diffLines.push({ kind: 'deleted', text })
+    } else if (line.startsWith(' ')) {
+      current.diffLines.push({ kind: 'context', text: line.slice(1) })
+    }
   }
 
   return {
@@ -71,7 +81,7 @@ function extractAddedDependencies(files: ParsedDiffFile[]): ParsedDiff['addedDep
   for (const file of files) {
     if (!/(^|\/)package\.json$/.test(file.path)) continue
     let section: ParsedDiff['addedDependencies'][number]['kind'] | undefined
-    for (const line of file.addedLines) {
+    for (const { kind, text: line } of file.diffLines) {
       const sectionMatch = depSectionPattern.exec(line)
       if (sectionMatch?.[1]) {
         section = sectionMatch[1] as ParsedDiff['addedDependencies'][number]['kind']
@@ -81,6 +91,7 @@ function extractAddedDependencies(files: ParsedDiffFile[]): ParsedDiff['addedDep
         section = undefined
         continue
       }
+      if (kind !== 'added') continue
       const depMatch = depLinePattern.exec(line)
       if (depMatch?.[1]) deps.push({ path: file.path, name: depMatch[1], kind: section ?? 'dependencies' })
     }

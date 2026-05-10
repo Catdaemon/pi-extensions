@@ -138,6 +138,7 @@ export class IndexScheduler {
   private currentWorker: ChildProcess | undefined
   private externalWorkerPid: number | undefined
   private lastEmbeddingBackfillEnqueueAt = 0
+  private workerStartLockHeld = false
 
   constructor(
     private readonly options: {
@@ -339,6 +340,7 @@ export class IndexScheduler {
       try {
         await mkdir(lockDir)
         await writeFile(join(lockDir, 'owner-pid'), `${process.pid}\n`, 'utf8')
+        this.workerStartLockHeld = true
         return
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
@@ -361,7 +363,12 @@ export class IndexScheduler {
   }
 
   private async releaseWorkerStartLock(): Promise<void> {
-    await rm(this.startLockDir(), { recursive: true, force: true })
+    if (!this.workerStartLockHeld) return
+    this.workerStartLockHeld = false
+    const lockDir = this.startLockDir()
+    const ownerPid = await readLockPid(lockDir)
+    if (ownerPid !== process.pid) return
+    await rm(lockDir, { recursive: true, force: true })
   }
 
   private async waitForWorkerSlot(): Promise<void> {

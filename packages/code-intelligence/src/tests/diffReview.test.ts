@@ -34,6 +34,22 @@ diff --git a/package.json b/package.json
     assert(parsed.addedDependencies.some((item) => item.name === 'moment'))
   })
 
+  it('uses package.json diff context to classify dependency additions', () => {
+    const diff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -10,6 +10,7 @@
+   "devDependencies": {
++    "vitest": "^3.0.0",
+     "typescript": "^5.8.3"
+   }
+`
+
+    const parsed = parseUnifiedDiff(diff)
+
+    assert.deepEqual(parsed.addedDependencies, [{ path: 'package.json', name: 'vitest', kind: 'devDependencies' }])
+  })
+
   it('detects forbidden imports and generated file edits', async () => {
     const { db, storage } = await setupDb()
     try {
