@@ -9,7 +9,11 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@catdaemon/pi-sidebar": ["../sidebar/src/index.ts"]
+    }
   },
-  "include": ["index.ts", "src/**/*.ts"]
+  "include": ["index.ts", "src/**/*.ts", "../sidebar/src/index.ts"]
 }
