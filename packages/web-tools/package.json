@@ -1,0 +1,31 @@
+{
+  "name": "@catdaemon/pi-web-tools",
+  "version": "0.1.0",
+  "description": "Web search and fetch tools for Pi.",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "web-search", "web-fetch", "exa"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Catdaemon/pi-extensions",
+    "directory": "packages/web-tools"
+  },
+  "homepage": "https://github.com/Catdaemon/pi-extensions/tree/main/packages/web-tools#readme",
+  "bugs": { "url": "https://github.com/Catdaemon/pi-extensions/issues" },
+  "pi": { "extensions": ["./index.ts"] },
+  "files": ["index.ts", "README.md", "LICENSE", "package.json", "tsconfig.json"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/tests/*.test.ts",
+    "pack:dry-run": "npm pack --dry-run --ignore-scripts",
+    "prepack": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "html-to-text": "^10.0.0",
+    "turndown": "^7.2.4"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
