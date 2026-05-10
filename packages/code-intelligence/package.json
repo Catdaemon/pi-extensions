@@ -1,6 +1,6 @@
 {
   "name": "@catdaemon/pi-code-intelligence",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Local codebase graph, semantic search, repo learnings, and review tools for Pi.",
   "type": "module",
   "keywords": ["pi-package", "pi", "code-intelligence", "code-review", "semantic-search"],
@@ -21,7 +21,7 @@
     "prepack": "npm run typecheck && npm test"
   },
   "dependencies": {
-    "@catdaemon/pi-sidebar": "workspace:*",
+    "@catdaemon/pi-sidebar": "^0.1.1",
     "@huggingface/transformers": "^4.2.0",
     "better-sqlite3": "^11.10.0",
     "chokidar": "^5.0.0",

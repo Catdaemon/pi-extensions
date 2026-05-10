@@ -42,8 +42,8 @@ importers:
   packages/code-intelligence:
     dependencies:
       '@catdaemon/pi-sidebar':
-        specifier: workspace:*
-        version: link:../sidebar
+        specifier: ^0.1.1
+        version: 0.1.1(@earendil-works/pi-coding-agent@0.74.0(ws@8.20.0)(zod@4.4.3))(@earendil-works/pi-tui@0.74.0)
       '@earendil-works/pi-ai':
         specifier: '*'
         version: 0.74.0(ws@8.20.0)(zod@4.4.3)
@@ -105,8 +105,8 @@ importers:
   packages/todos:
     dependencies:
       '@catdaemon/pi-sidebar':
-        specifier: workspace:*
-        version: link:../sidebar
+        specifier: ^0.1.1
+        version: 0.1.1(@earendil-works/pi-coding-agent@0.74.0(ws@8.20.0)(zod@4.4.3))(@earendil-works/pi-tui@0.74.0)
       '@earendil-works/pi-ai':
         specifier: '*'
         version: 0.74.0(ws@8.20.0)(zod@4.4.3)
@@ -286,6 +286,12 @@ packages:
 
   '@borewit/text-codec@0.2.2':
     resolution: {integrity: sha512-DDaRehssg1aNrH4+2hnj1B7vnUGEjU6OIlyRdkMd0aUdIUvKXrJfXsy8LVtXAy7DRvYVluWbMspsRhz2lcW0mQ==}
+
+  '@catdaemon/pi-sidebar@0.1.1':
+    resolution: {integrity: sha512-CV0dS/0Gl9zXLj0IO3W7oCTgGvSHaVL7uUrSJPOqP0gn60ExleovJ/aFUbvaWpSrMqEkpUd+EMp0v4IcsZNpMg==}
+    peerDependencies:
+      '@earendil-works/pi-coding-agent': '*'
+      '@earendil-works/pi-tui': '*'
 
   '@drizzle-team/brocli@0.10.2':
     resolution: {integrity: sha512-z33Il7l5dKjUgGULTqBsQBQwckHh5AbIuxhdsIxDDiZAzBOrZO6q9ogcWC65kU382AfynTfgNumVcNIjuIua6w==}
@@ -2545,6 +2551,11 @@ snapshots:
   '@babel/runtime@7.29.2': {}
 
   '@borewit/text-codec@0.2.2': {}
+
+  '@catdaemon/pi-sidebar@0.1.1(@earendil-works/pi-coding-agent@0.74.0(ws@8.20.0)(zod@4.4.3))(@earendil-works/pi-tui@0.74.0)':
+    dependencies:
+      '@earendil-works/pi-coding-agent': 0.74.0(ws@8.20.0)(zod@4.4.3)
+      '@earendil-works/pi-tui': 0.74.0
 
   '@drizzle-team/brocli@0.10.2': {}
 

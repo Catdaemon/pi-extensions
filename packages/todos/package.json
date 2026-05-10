@@ -1,6 +1,6 @@
 {
   "name": "@catdaemon/pi-agent-todos",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Conversation todo tools, prompt guidance, and status sidebar for Pi.",
   "type": "module",
   "keywords": ["pi-package", "pi", "todos", "agent-tools"],
@@ -21,7 +21,7 @@
     "prepack": "npm run typecheck && npm test"
   },
   "dependencies": {
-    "@catdaemon/pi-sidebar": "workspace:*"
+    "@catdaemon/pi-sidebar": "^0.1.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
