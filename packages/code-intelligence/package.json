@@ -1,6 +1,6 @@
 {
   "name": "@catdaemon/pi-code-intelligence",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Local codebase graph, semantic search, repo learnings, and review tools for Pi.",
   "type": "module",
   "keywords": ["pi-package", "pi", "code-intelligence", "code-review", "semantic-search"],

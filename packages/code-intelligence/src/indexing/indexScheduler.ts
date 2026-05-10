@@ -136,6 +136,7 @@ export class IndexScheduler {
   private lastFullIndexResult: FullIndexResult | undefined
   private lastIncrementalIndexResult: IncrementalIndexResult | undefined
   private currentWorker: ChildProcess | undefined
+  private currentJobKind: IndexJob['kind'] | undefined
   private externalWorkerPid: number | undefined
   private lastEmbeddingBackfillEnqueueAt = 0
   private workerStartLockHeld = false
@@ -240,6 +241,7 @@ export class IndexScheduler {
       running: this.running,
       queuedJobs: this.queue.length,
       workerPid: this.currentWorker?.pid ?? this.externalWorkerPid,
+      currentJobKind: this.currentJobKind,
       lastFullIndexResult: this.lastFullIndexResult,
       lastIncrementalIndexResult: this.lastIncrementalIndexResult,
       stats,
@@ -263,7 +265,9 @@ export class IndexScheduler {
         if (this.stopped) break
         const job = this.queue.shift()
         if (!job) continue
+        this.currentJobKind = job.kind
         const result = await this.runJobInWorker(job)
+        this.currentJobKind = undefined
         if (job.kind === 'fullRepoIndex') this.lastFullIndexResult = result as FullIndexResult
         else this.lastIncrementalIndexResult = result as IncrementalIndexResult
       }
@@ -271,6 +275,7 @@ export class IndexScheduler {
       this.options.logger.error('index job failed', { error: (error as Error).message })
     } finally {
       this.currentWorker = undefined
+      this.currentJobKind = undefined
       this.running = false
     }
   }

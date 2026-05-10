@@ -101,6 +101,22 @@ export function extractManualLearning(text: string): LearningCandidate | undefin
     })
   }
 
+  const parenthesizedAlways = /\((always\s+(?:use|prefer|add|run|keep|write|put|place|check|look\s+up|validate|call|name|import|export|mock|edit|modify|include)\b[^)]*)\)/i.exec(trimmed)
+  if (parenthesizedAlways) {
+    const guidance = cleanupTerm(parenthesizedAlways[1] ?? '')
+    const scopeMatch = /\bfor\s+([\w\s/-]+?)(?:\s+work|\s+changes|\s+tasks)?(?:[).]|$)/i.exec(guidance)
+    const scope = cleanupTerm(scopeMatch?.[1] ?? '')
+    return candidate({
+      title: titleFromText(guidance),
+      summary: guidance.charAt(0).toUpperCase() + guidance.slice(1).replace(/[.。]?$/, '.'),
+      ruleType: inferRuleType(guidance),
+      appliesWhen: scope ? `When doing ${scope} work in this repo.` : 'When working in this repo and this guidance is relevant.',
+      prefer: guidance,
+      confidence: 1,
+      priority: 75,
+    })
+  }
+
   return candidate({
     title: titleFromText(trimmed),
     summary: trimmed,

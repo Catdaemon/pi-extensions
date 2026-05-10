@@ -59,7 +59,7 @@ export class CodeIntelligenceProgressWidget implements Component {
       [
         ` → ${action} • ${worker}`,
         ` ○ Phase ${indexingState?.progress_phase ?? 'pending'}${indexingState?.progress_current_path ? ` • ${indexingState.progress_current_path}` : ''}`,
-        ` ○ Files ${indexingState?.progress_files_scanned ?? indexStatus.stats.activeFiles ?? 0}/${indexStatus.stats.totalFiles ?? '?'} • embeddings ${embeddingStats.embeddedChunks}/${embeddingStats.totalEmbeddableChunks} (${pct})`,
+        ` ○ ${formatFileProgress(indexStatus.currentJobKind, indexingState?.progress_files_scanned ?? indexStatus.stats.activeFiles ?? 0, indexStatus.stats.totalFiles)} • embeddings ${embeddingStats.embeddedChunks}/${embeddingStats.totalEmbeddableChunks} (${pct})`,
         ` ○ Status ${embeddingStatus}${embeddingStats.missingEmbeddings > 0 ? ` • ${embeddingStats.missingEmbeddings} missing` : ''}`,
         ` ○ Graph entities ${indexingState?.progress_entities_extracted ?? 0} • relationships ${indexingState?.progress_relationships_extracted ?? 0}`,
       ],
@@ -75,6 +75,13 @@ export class CodeIntelligenceProgressWidget implements Component {
     this.cachedWidth = undefined
     this.cachedLines = undefined
   }
+}
+
+export function formatFileProgress(jobKind: string | undefined, processedFiles: number, totalFiles: number | undefined): string {
+  if (jobKind === 'changedFilesIndex') return `Changed files ${processedFiles}`
+  if (jobKind === 'deletedFileCleanup') return `Deleted files ${processedFiles}`
+  if (jobKind === 'embeddingBackfill') return `Files ${totalFiles ?? processedFiles}`
+  return `Files ${processedFiles}/${totalFiles ?? '?'}`
 }
 
 function style(theme: ProgressTheme | undefined, color: string, text: string): string {

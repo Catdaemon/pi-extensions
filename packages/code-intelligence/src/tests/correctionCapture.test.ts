@@ -21,6 +21,7 @@ describe('automatic correction capture', () => {
     assert.equal(activationStatusForConfidence(correctionConfidence('Never edit generated clients')), 'active')
     assert.equal(activationStatusForConfidence(correctionConfidence('that is wrong here')), 'draft')
     assert.equal(maybeCorrectionSignal("let's always use subagents if available"), false)
+    assert.equal(maybeCorrectionSignal("Let's add sort/filter/pagination using codebase conventions (always look up and use codebase conventions for ui work) for each of the tables"), true)
     assert.equal(maybeCorrectionSignal("let's ensure we use proper type inference instead of using the as keyword"), true)
     assert.equal(maybeCorrectionSignal("let's ensure we're writing tests for anything we add"), true)
     assert.equal(maybeCorrectionSignal('make sure we use explicit return types instead of inferred API response types'), true)
@@ -79,6 +80,25 @@ describe('automatic correction capture', () => {
       const learning = listLearnings(db, runtime.identity.repoKey, 'draft')[0]
       assert.equal(learning?.prefer, 'proper type inference')
       assert.equal(learning?.avoid, 'the as keyword')
+    } finally {
+      db.close()
+      await rm(storage, { recursive: true, force: true })
+    }
+  })
+
+  it('captures parenthesized always guidance inside task requests', async () => {
+    const storage = await mkdtemp(join(tmpdir(), 'pi-code-intelligence-correction-db-'))
+    const db = await openCodeIntelligenceDb(storage)
+    const runtime = makeRuntime(db, storage)
+
+    try {
+      const text = 'Let\'s add sort/filter/pagination using codebase conventions (always look up and use codebase conventions for ui work) for each of the tables'
+      const result = await captureCorrectionLearning(runtime, text)
+      assert.equal(result.kind, 'stored')
+      assert.equal(result.kind === 'stored' ? result.status : undefined, 'active')
+      const learning = listLearnings(db, runtime.identity.repoKey, 'active')[0]
+      assert.equal(learning?.ruleType, 'prefer_pattern')
+      assert.match(learning?.summary ?? '', /always look up and use codebase conventions for ui work/i)
     } finally {
       db.close()
       await rm(storage, { recursive: true, force: true })

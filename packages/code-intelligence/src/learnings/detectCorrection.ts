@@ -13,7 +13,7 @@ const CORRECTION_PATTERNS = [
   /\blet['’]?s\s+(?:ensure|make\s+sure)\s+(?:we(?:'re|\s+are)?\s+)?(?:write|writing|add|adding|include|including)\s+tests\b/i,
   /\bwe\s+should\s+use\b/i,
   /\bwe\s+should\s+(?:write|add|include)\s+tests\b/i,
-  /\b(?:please\s+)?(?:always|never)\s+(?:use|prefer|add|run|keep|write|put|place|check|validate|call|name|import|export|mock|edit|modify|include)\b/i,
+  /\b(?:please\s+)?(?:always|never)\s+(?:use|prefer|add|run|keep|write|put|place|check|look\s+up|validate|call|name|import|export|mock|edit|modify|include)\b/i,
   /\b(?:make\s+sure|ensure)\s+(?:we\s+)?(?:use|write|add|include|check|validate)\b/i,
   /\bnot\s+the\s+pattern\b/i,
   /\bthat['’]?s\s+wrong\s+here\b/i,
@@ -34,6 +34,7 @@ function isConversationalNonGuidance(text: string): boolean {
   const lower = text.toLowerCase()
   if (/\b(let's|lets)\s+(?:ensure|make\s+sure)\s+(?:we\s+)?use\b/.test(lower)) return false
   if (/\b(let's|lets)\s+(?:ensure|make\s+sure)\s+(?:we(?:'re|\s+are)?\s+)?(?:write|writing|add|adding|include|including)\s+tests\b/.test(lower)) return false
+  if (/\([^)]*\balways\s+(?:use|prefer|add|run|keep|write|put|place|check|look\s+up|validate|call|name|import|export|mock|edit|modify|include)\b[^)]*\)/.test(lower)) return false
   if (/\b(let's|lets|can we|could we|why is|what else|is there|seems logical|interestingly|looks good|never mind|for now)\b/.test(lower)) return true
   if (/\b(message to you|my message|your message|you in there|without any context)\b/.test(lower)) return true
   return false

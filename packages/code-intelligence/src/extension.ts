@@ -14,7 +14,7 @@ import { getEmbeddingStatus } from './db/repositories/embeddingStatusRepo.ts'
 import { getIndexingState } from './db/repositories/indexingStateRepo.ts'
 import { appendLearningEvent } from './db/repositories/eventsRepo.ts'
 import { createLearning, listLearnings, updateLearningStatus } from './db/repositories/learningsRepo.ts'
-import type { CodebaseLearning, LearningStatus } from './learnings/types.ts'
+import type { CodebaseLearning, LearningRuleType, LearningStatus } from './learnings/types.ts'
 import {
   consolidateSimilarLearnings,
   findStaleLearnings,
@@ -31,6 +31,7 @@ import { CodeIntelligenceLogger } from './logger.ts'
 import { enableCodeIntelligenceRepo, disableCodeIntelligenceRepo, isCodeIntelligenceEnabled, listEnabledRepoRecords } from './repo/enabledRepos.ts'
 import { identifyRepo, type RepoIdentity } from './repo/identifyRepo.ts'
 import { captureCorrectionLearning, createOrReuseLearning } from './pi/correctionCapture.ts'
+import { scopeLearningCandidate } from './learnings/scopeLearning.ts'
 import { rewriteLearningCandidateWithModel } from './pi/learningRewrite.ts'
 import { normalizeReviewFeedbackAction, buildLearningCandidateFromReviewFeedback } from './pi/reviewFeedback.ts'
 import { findSourceTestCounterparts, retrievePlanningContextPack, formatPlanningContextMessage } from './pi/planningIntegration.ts'
@@ -59,6 +60,58 @@ const reviewFeedbackSchema = Type.Object({
   correction: Type.Optional(Type.String({ description: 'What should be learned for future reviews.' })),
   pathGlobs: Type.Optional(Type.Array(Type.String(), { description: 'Optional path globs where this feedback applies.' })),
 })
+
+const recordLearningSchema = Type.Object({
+  title: Type.String({ description: 'Short title for the durable repo learning.' }),
+  summary: Type.String({ description: 'Concise reusable guidance to remember for future work.' }),
+  ruleType: Type.String({ description: 'Learning type: avoid_pattern, prefer_pattern, testing_convention, architecture, dependency_policy, generated_code, style, domain_rule, or workflow.' }),
+  appliesWhen: Type.String({ description: 'When this learning applies.' }),
+  avoid: Type.Optional(Type.String({ description: 'Pattern or behavior to avoid, if applicable.' })),
+  prefer: Type.Optional(Type.String({ description: 'Preferred pattern or behavior, if applicable.' })),
+  pathGlobs: Type.Optional(Type.Array(Type.String(), { description: 'Optional repo-relative path globs where this applies.' })),
+  languages: Type.Optional(Type.Array(Type.String(), { description: 'Optional languages where this applies.' })),
+  confidence: Type.Optional(Type.Number({ description: 'Confidence from 0 to 1. Defaults to 0.75.' })),
+  priority: Type.Optional(Type.Number({ description: 'Priority from 0 to 100. Defaults to 60.' })),
+  status: Type.Optional(Type.String({ description: 'Learning status: draft or active. Use draft for ambiguous guidance.' })),
+})
+
+const LEARNING_RULE_TYPES: LearningRuleType[] = [
+  'avoid_pattern',
+  'prefer_pattern',
+  'testing_convention',
+  'architecture',
+  'dependency_policy',
+  'generated_code',
+  'style',
+  'domain_rule',
+  'workflow',
+]
+
+function normalizeLearningRuleType(value: string): LearningRuleType {
+  const match = LEARNING_RULE_TYPES.find((ruleType) => ruleType === value)
+  return match ?? 'prefer_pattern'
+}
+
+function normalizeLearningStatus(value: string | undefined, confidence: number): 'active' | 'draft' {
+  if (value === 'active') return 'active'
+  if (value === 'draft') return 'draft'
+  return confidence >= 0.85 ? 'active' : 'draft'
+}
+
+function clampNumber(value: number | undefined, fallback: number, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  return Math.min(max, Math.max(min, value))
+}
+
+export function buildLearningCaptureGuidance(): string {
+  return [
+    'When the user gives durable repo guidance, preferences, corrections, or conventions that should apply to future work, call code_intelligence_record_learning.',
+    'Do not record ordinary one-off task requirements. Record only reusable guidance; use status=draft when ambiguous.',
+    'Low-token examples:',
+    '- User: "Don\'t use regex validation here; use the Zod schemas in validation.schemas.ts" -> record prefer existing Zod schemas over ad-hoc regex validation for server validation.',
+    '- User: "Always look up codebase conventions for UI work" -> record follow existing UI conventions when doing UI work.',
+  ].join('\n')
+}
 
 const codeIntelligenceImpactSchema = Type.Object({
   paths: Type.Array(Type.String(), { description: 'File paths to inspect for impact context.' }),
@@ -148,7 +201,7 @@ type ParsedReviewOutput = {
   markdown: string
 }
 
-function buildCodeIntelligenceReviewPrompt(scope: SelectedScope, extraFocus: string | undefined, intelligence: ImproveCodeIntelligenceResult): string {
+export function buildCodeIntelligenceReviewPrompt(scope: SelectedScope, extraFocus: string | undefined, intelligence: ImproveCodeIntelligenceResult): string {
   const modeInstructions = improveModeInstructions(intelligence.mode)
   return `You are running a /code-intelligence-review pass.
 
@@ -163,15 +216,16 @@ Review playbook:
 2. For every reviewed file, assess every issue category in the output schema: correctness, security, reliability/resource, performance, maintainability/convention, docs when applicable, and test coverage. Form concrete hypotheses about possible bugs, inconsistencies, missing tests, or risky AI-slop patterns. A hypothesis should name the suspected failure mode and the contract it might violate.
 3. For each plausible hypothesis, search related code and learned context before reporting it: graph edges, imports/imported-by, callers/callees, tests/counterparts, similar implementations, hard rules, and high-confidence learnings.
 4. Follow call/data chains far enough to confirm or discard the hypothesis. For high-risk files, trace untrusted inputs to sensitive sinks and check validation, authorization/ownership/tenant checks, sanitization, escaping, timeout/retry/cancellation behavior, error handling, and whether secrets/PII can leak to logs or responses.
-5. Check cross-file contracts using graph context: caller expectations, return shapes, thrown errors, nullable/undefined behavior, schema/API changes, component props, hook lifecycle assumptions, cache invalidation, and whether tests/counterparts were updated.
-6. Check AI-slop/code-quality issues aggressively, while still requiring concrete risk. Look for: copy/pasted logic that will drift; duplicate types/schemas/validation rules; useless null checks or try/catch blocks that hide errors; broad catch-all handling that returns fake success; dead branches and impossible states; over-abstracted helpers that obscure simple logic; vague names like data/result/handler where domain names are needed; inconsistent patterns versus similar files; large mixed-concern files; hallucinated dependencies/APIs/options; comments that restate code; TODOs used instead of implementation; tests that only assert mocks or snapshots without behavior; and generated-looking code that bypasses repo conventions.
-7. Confirm or discard every hypothesis before final output. Report only findings that survive revalidation against guards, tests, configs, related files, and documented contracts; downgrade or omit speculative findings.
-8. For every credible P1/P2 bug/security/reliability finding, propose a concrete negative test or regression test that would fail before the fix. If no test is appropriate, explain why.
+5. Before proposing any validation, parsing, auth, data-access, API, or test fix, inspect existing local patterns and name them in the finding: shared schemas, validators, safeParse/parse helpers, middleware, error helpers, test factories, route/service conventions, and similar implementations. Prefer the repo's existing abstraction even when an inline regex or ad-hoc helper would be the smallest functional patch. If the changed code bypasses an established pattern, report that convention violation with concrete evidence.
+6. Check cross-file contracts using graph context: caller expectations, return shapes, thrown errors, nullable/undefined behavior, schema/API changes, component props, hook lifecycle assumptions, cache invalidation, and whether tests/counterparts were updated.
+7. Check AI-slop/code-quality issues aggressively, while still requiring concrete risk. Look for: copy/pasted logic that will drift; duplicate types/schemas/validation rules; ad-hoc validation/parsing when shared schemas or local conventions exist; useless null checks or try/catch blocks that hide errors; broad catch-all handling that returns fake success; dead branches and impossible states; over-abstracted helpers that obscure simple logic; vague names like data/result/handler where domain names are needed; inconsistent patterns versus similar files; large mixed-concern files; hallucinated dependencies/APIs/options; comments that restate code; TODOs used instead of implementation; tests that only assert mocks or snapshots without behavior; and generated-looking code that bypasses repo conventions.
+8. Confirm or discard every hypothesis before final output. Report only findings that survive revalidation against guards, tests, configs, related files, documented contracts, and local implementation conventions; downgrade or omit speculative findings.
+9. For every credible P1/P2 bug/security/reliability finding, propose a concrete negative test or regression test that would fail before the fix. If no test is appropriate, explain why.
 9. Review every changed/assigned file and relevant graph/source-test context before finishing. Include a coverage row for every reviewed file, even files with no findings, and make the coverage row reflect the categories assessed rather than merely saying no findings.
 10. Report only high-signal issues, but treat confirmed AI-slop as high-signal when it increases future bug likelihood, obscures control/data flow, duplicates business rules, weakens tests, or hides failures. Avoid pure style preferences, broad rewrites, or “could be cleaner” comments without that risk tie.
-11. Suggest the smallest warranted fix for each finding. Do not make code edits.
-12. Include a readiness score from 0-5.
-13. Finish with a machine-readable JSON block between these exact markers so Pi can open an interactive review panel:
+12. Suggest the smallest warranted fix for each finding. The suggested fix must cite the existing local pattern or explain that no pattern was found after checking related code.
+13. Include a readiness score from 0-5.
+14. Finish with a machine-readable JSON block between these exact markers so Pi can open an interactive review panel:
 ${REVIEW_JSON_START}
 {"findings":[{"id":"CI-1","severity":"P2","title":"Short title","file":"path/to/file.ts","line":"L10-L12","confidence":0.8,"type":"correctness","riskArea":"external input/API/routes","evidence":"specific code/diff/graph evidence","dataFlow":"input -> validation -> sink, or n/a","contractsChecked":["caller path or test path"],"testsToAdd":["concrete negative/regression test"],"revalidation":"why this is still valid after checking guards/tests/contracts","suggestedFix":"smallest fix"}],"coverage":[{"file":"path/to/file.ts","riskArea":"...","findings":["CI-1"],"validation":"not run","contextInspected":["imports/callers/tests/similar files"]}],"readinessScore":3}
 ${REVIEW_JSON_END}
@@ -181,6 +235,7 @@ ${modeInstructions.map((instruction, index) => `${14 + index}. ${instruction}`).
 Important constraints:
 - Stay within the selected scope unless a tiny adjacent check is required to validate a finding.
 - Do not invent large refactors without evidence from touched code.
+- Do not suggest ad-hoc validation/parsing/auth/test helpers until you have checked existing local conventions and shared schemas/helpers.
 - Do not make cosmetic recommendations; every edit suggestion must reduce real risk, remove harmful duplication, materially improve clarity, or add meaningful test coverage.
 - Treat Code Intelligence hard rules and high-confidence learnings as high-priority repo constraints.`.trim()
 }
@@ -258,7 +313,7 @@ function chunkArray<T>(values: T[], size: number): T[][] {
   return chunks
 }
 
-function buildSubagentReviewTaskTemplate(extraFocus?: string): string {
+export function buildSubagentReviewTaskTemplate(extraFocus?: string): string {
   return [
     'You are code-review subagent <id>. Review only your assigned files; do not edit files.',
     'Assigned files: <files from task spec>.',
@@ -268,10 +323,11 @@ function buildSubagentReviewTaskTemplate(extraFocus?: string): string {
     'For each assigned file and category, form concrete hypotheses about bugs, inconsistencies, missing tests, or risky AI-slop patterns before reporting anything. If a category has no credible hypothesis after inspection, note that in coverage rather than omitting the file.',
     'Retrieve context lazily to confirm or discard each hypothesis: first call code_intelligence_impact for the assigned files, then call code_intelligence_search with changedFiles/currentFiles set to the assigned files and targeted queries for graph edges, callers/callees, tests/counterparts, similar implementations, hard rules, and learnings. Read exact files/diffs only after that.',
     'For risky files, follow call/data chains far enough to verify validation, authz/ownership/tenant checks, sanitization, timeouts/retries/cancellation, cleanup, and PII/secret logging behavior.',
+    'Before proposing any validation, parsing, auth, data-access, API, or test fix, inspect existing local patterns and name them in the finding: shared schemas, validators, safeParse/parse helpers, middleware, error helpers, test factories, route/service conventions, and similar implementations. Prefer the repo\'s existing abstraction even when an inline regex or ad-hoc helper would be the smallest functional patch. If the changed code bypasses an established pattern, report that convention violation with concrete evidence.',
     'Check cross-file contracts through callers/callees/imports/tests: return shapes, thrown errors, nullable behavior, schema/API changes, component props, hook lifecycle, cache invalidation, and counterpart tests.',
-    'Aggressively hunt AI-slop issues with real impact: copy/pasted logic that will drift; duplicate types/schemas/validation rules; useless null checks or try/catch blocks that hide errors; broad catch-all handling that returns fake success; dead branches and impossible states; over-abstracted helpers that obscure simple logic; vague names like data/result/handler where domain names are needed; inconsistent patterns versus similar files; large mixed-concern files; hallucinated dependencies/APIs/options; comments that restate code; TODOs used instead of implementation; tests that only assert mocks or snapshots without behavior; and generated-looking code that bypasses repo conventions.',
-    'Before reporting, explicitly confirm or discard each hypothesis by trying to disprove it against guards, tests, configs, related files, learned context, and documented contracts. Omit speculative nits, but do not omit coverage for files/categories you assessed.',
-    'For each P1/P2 bug/security/reliability finding, include a concrete negative/regression test that would fail before the fix.',
+    'Aggressively hunt AI-slop issues with real impact: copy/pasted logic that will drift; duplicate types/schemas/validation rules; ad-hoc validation/parsing when shared schemas or local conventions exist; useless null checks or try/catch blocks that hide errors; broad catch-all handling that returns fake success; dead branches and impossible states; over-abstracted helpers that obscure simple logic; vague names like data/result/handler where domain names are needed; inconsistent patterns versus similar files; large mixed-concern files; hallucinated dependencies/APIs/options; comments that restate code; TODOs used instead of implementation; tests that only assert mocks or snapshots without behavior; and generated-looking code that bypasses repo conventions.',
+    'Before reporting, explicitly confirm or discard each hypothesis by trying to disprove it against guards, tests, configs, related files, learned context, documented contracts, and local implementation conventions. Omit speculative nits, but do not omit coverage for files/categories you assessed.',
+    'For each P1/P2 bug/security/reliability finding, include a concrete negative/regression test that would fail before the fix. Suggested fixes must cite the existing local pattern or explain that no pattern was found after checking related code.',
     'Return strict JSON only: {"findings":[{"id":"<id>-1","severity":"P0|P1|P2|P3","title":"...","file":"...","line":"Lx-Ly","confidence":0.0,"type":"correctness|test|convention|maintainability|security|performance|resource|docs","riskArea":"...","evidence":"...","dataFlow":"... or n/a","contractsChecked":["..."],"testsToAdd":["..."],"revalidation":"...","suggestedFix":"..."}],"coverage":[{"file":"...","riskArea":"...","findings":["..."],"validation":"not run","contextInspected":["..."]}],"readinessScore":0}',
   ].filter(Boolean).join('\n')
 }
@@ -338,13 +394,13 @@ function formatFindingPromptLines(finding: ParsedReviewFinding): string[] {
 
 type ReviewPanelAction = 'skip' | 'fix' | 'accepted' | 'false_positive' | 'needs_changes'
 
-function buildReviewBatchActionPrompt(actions: Array<{ finding: ParsedReviewFinding; action: ReviewPanelAction }>): string {
+export function buildReviewBatchActionPrompt(actions: Array<{ finding: ParsedReviewFinding; action: ReviewPanelAction }>): string {
   const selected = actions.filter((item) => item.action !== 'skip')
   const feedback = selected.filter((item) => item.action !== 'fix')
   const fixes = selected.filter((item) => item.action === 'fix')
   return [
     'Apply these /code-intelligence-review panel actions in one pass.',
-    'For every feedback item, call code_intelligence_review_feedback with the requested action. For every fix item, first record code_intelligence_review_feedback action=accepted because selecting a fix means the finding was useful, then make the smallest safe code change and run targeted validation.',
+    'For every feedback item, call code_intelligence_review_feedback with the requested action. For every fix item, first record code_intelligence_review_feedback action=accepted because selecting a fix means the finding was useful, then inspect related local patterns before editing. Use existing schemas/helpers/middleware/test factories and repo conventions; do not implement ad-hoc validation/parsing/auth/test helpers when a local pattern exists. Then make the smallest safe code change and run targeted validation.',
     '',
     feedback.length > 0 ? 'Feedback only:' : '',
     ...feedback.map(({ finding, action }) => [`- action=${action}`, ...formatFindingPromptLines(finding).map((line) => `  ${line}`)].join('\n')),
@@ -454,9 +510,7 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
     if (!runtime || event.source === 'extension') return { action: 'continue' }
     const activeRuntime = runtime
     const text = event.text
-    void captureCorrectionLearning(activeRuntime, text, {
-      rewrite: (candidateText, fallback) => rewriteLearningCandidateWithModel(ctx, candidateText, fallback),
-    })
+    void captureCorrectionLearning(activeRuntime, text)
       .then((result) => {
         if (result.kind === 'stored' && result.status === 'active') {
           logger.info('captured code intelligence correction', {
@@ -485,14 +539,14 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
   pi.on('before_agent_start', async (event) => {
     if (!runtime) return undefined
     const contextPack = await retrievePlanningContextPack(runtime, event.prompt)
-    if (!contextPack || (contextPack.codeContext.length === 0 && contextPack.learnings.length === 0 && contextPack.hardRules.length === 0)) return undefined
-    lastRetrievedContext = { source: 'planning', at: new Date().toISOString(), contextPack }
+    const hasContext = Boolean(contextPack && (contextPack.codeContext.length > 0 || contextPack.learnings.length > 0 || contextPack.hardRules.length > 0))
+    if (contextPack && hasContext) lastRetrievedContext = { source: 'planning', at: new Date().toISOString(), contextPack }
     return {
       message: {
         customType: 'code-intelligence-context',
-        content: formatPlanningContextMessage(contextPack),
+        content: [buildLearningCaptureGuidance(), contextPack && hasContext ? formatPlanningContextMessage(contextPack) : undefined].filter(Boolean).join('\n\n'),
         display: false,
-        details: {
+        details: contextPack ? {
           freshness: contextPack.freshness,
           hardRules: contextPack.hardRules.map((rule) => ({
             id: rule.id,
@@ -514,7 +568,7 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
             score: chunk.score,
             reasons: chunk.reasons,
           })),
-        },
+        } : { guidance: 'learning_capture' },
       },
     }
   })
@@ -713,6 +767,70 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
       const report = formatMissingTestsReport(paths, impact, resolvedRuntime.runtime.config.testPaths)
       if (ctx.hasUI) await ctx.ui.editor('Code intelligence missing tests', report)
       else console.log(report)
+    },
+  })
+
+  pi.registerTool<typeof recordLearningSchema>({
+    name: 'code_intelligence_record_learning',
+    label: 'Code Intelligence Record Learning',
+    description: 'Record durable repo guidance, conventions, preferences, or corrections as a codebase learning.',
+    promptSnippet: 'Record reusable codebase guidance when the user gives durable repo conventions or corrections.',
+    promptGuidelines: [
+      'Use code_intelligence_record_learning when the user gives durable repo guidance, preferences, corrections, or conventions that should apply to future work.',
+      'Do not use code_intelligence_record_learning for ordinary one-off task requirements.',
+      'Use code_intelligence_record_learning with status draft when the guidance is plausible but ambiguous, and active only when the user states it clearly.',
+      'Use code_intelligence_record_learning examples sparingly; prefer concise title, summary, appliesWhen, avoid, and prefer fields.',
+    ],
+    parameters: recordLearningSchema,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const targetCwd = ctx.cwd
+      const resolvedRuntime = await ensureRuntimeForCwd(targetCwd, ctx)
+      if (!resolvedRuntime.runtime) {
+        return {
+          content: [{ type: 'text', text: resolvedRuntime.warning ?? 'Code intelligence is not active for this session. Use /enable-code-intelligence first.' }],
+          details: { active: false, error: 'inactive_or_wrong_repo' },
+        }
+      }
+      const input = params as {
+        title: string
+        summary: string
+        ruleType: string
+        appliesWhen: string
+        avoid?: string
+        prefer?: string
+        pathGlobs?: string[]
+        languages?: string[]
+        confidence?: number
+        priority?: number
+        status?: string
+      }
+      const confidence = clampNumber(input.confidence, 0.75, 0, 1)
+      const candidate = scopeLearningCandidate({
+        title: input.title.trim(),
+        summary: input.summary.trim(),
+        ruleType: normalizeLearningRuleType(input.ruleType),
+        appliesWhen: input.appliesWhen.trim(),
+        avoid: input.avoid?.trim() || undefined,
+        prefer: input.prefer?.trim() || undefined,
+        pathGlobs: input.pathGlobs?.filter((item) => item.trim().length > 0),
+        languages: input.languages?.filter((item) => item.trim().length > 0),
+        confidence,
+        priority: clampNumber(input.priority, 60, 0, 100),
+        status: normalizeLearningStatus(input.status, confidence),
+        source: { kind: 'manual_note', timestamp: new Date().toISOString() },
+      }, { text: [input.title, input.summary, input.appliesWhen, input.avoid, input.prefer, ...(input.pathGlobs ?? [])].filter(Boolean).join('\n'), config: resolvedRuntime.runtime.config })
+      const embeddingService = resolvedRuntime.runtime.services.get<EmbeddingService>('embeddingService')
+      const { learning, reused } = await createOrReuseLearning(resolvedRuntime.runtime, candidate, embeddingService)
+      const eventId = appendLearningEvent(resolvedRuntime.runtime.db, {
+        repoKey: resolvedRuntime.runtime.identity.repoKey,
+        learningId: learning.id,
+        eventKind: 'manual_learning',
+        payload: { source: 'code_intelligence_record_learning', reused, title: learning.title, status: learning.status },
+      })
+      return {
+        content: [{ type: 'text', text: `${reused ? 'Reused' : 'Recorded'} learning ${learning.id}: ${learning.title}` }],
+        details: { active: true, eventId, reused, learning },
+      }
     },
   })
 
