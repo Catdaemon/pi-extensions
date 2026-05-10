@@ -1,6 +1,6 @@
 {
   "name": "@catdaemon/pi-sidebar",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Shared status-card sidebar helpers for Pi extensions.",
   "type": "module",
   "keywords": ["pi-package", "pi", "sidebar", "status-card"],

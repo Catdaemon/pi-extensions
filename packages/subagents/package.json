@@ -1,6 +1,6 @@
 {
   "name": "@catdaemon/pi-subagents",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Persistent subagent tools and UI for Pi.",
   "type": "module",
   "keywords": ["pi-package", "pi", "subagents", "agent-tools"],
