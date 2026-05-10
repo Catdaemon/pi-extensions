@@ -8,4 +8,5 @@ Monorepo for my Pi Agent extension packages.
 - `@catdaemon/pi-agent-todos` — todo tools and sidebar status card.
 - `@catdaemon/pi-subagents` — persistent subagent tools and UI.
 - `@catdaemon/pi-code-intelligence` — local codebase graph, semantic search, learnings, and review tools.
+- `@catdaemon/pi-cmux` — cmux status and notification integration.
 

@@ -39,6 +39,12 @@ importers:
         specifier: ^5.8.3
         version: 5.9.3
 
+  packages/cmux:
+    dependencies:
+      '@earendil-works/pi-coding-agent':
+        specifier: '*'
+        version: 0.74.0(ws@8.20.0)(zod@4.4.3)
+
   packages/code-intelligence:
     dependencies:
       '@earendil-works/pi-ai':

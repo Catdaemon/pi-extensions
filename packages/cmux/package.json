@@ -1,0 +1,26 @@
+{
+  "name": "@catdaemon/pi-cmux",
+  "version": "0.1.0",
+  "description": "cmux status and notification integration for Pi.",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "cmux", "notifications"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Catdaemon/pi-extensions",
+    "directory": "packages/cmux"
+  },
+  "homepage": "https://github.com/Catdaemon/pi-extensions/tree/main/packages/cmux#readme",
+  "bugs": { "url": "https://github.com/Catdaemon/pi-extensions/issues" },
+  "pi": { "extensions": ["./index.ts"] },
+  "files": ["index.ts", "src", "README.md", "LICENSE", "package.json", "tsconfig.json"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/tests/*.test.ts",
+    "pack:dry-run": "npm pack --dry-run --ignore-scripts",
+    "prepack": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
