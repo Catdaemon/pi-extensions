@@ -13,11 +13,57 @@ import {
 const DEFAULT_STATUS_KEY = 'pi-agent'
 const SUBAGENT_SESSION_DIR = join(getAgentDir(), 'subagents', 'sessions')
 
-type CmuxIntegrationConfig = {
+export type CmuxIntegrationConfig = {
   statusKey: string
   notifyDone: boolean
   includePromptPreviewInStatus: boolean
   includeSubagents: boolean
+}
+
+type ActiveTurn = {
+  prompt: string
+  startedAt: number
+}
+
+type FinishedTurn = ActiveTurn & {
+  remainingActiveTurns: number
+}
+
+export type CmuxTurnTracker = {
+  start(input: { key: string; prompt: string; ignored: boolean; now: number }): void
+  finish(key: string): FinishedTurn | undefined
+  activeCount(): number
+}
+
+function createTurnTracker(): CmuxTurnTracker {
+  const activeTurns = new Map<string, ActiveTurn>()
+  const ignoredTurns = new Set<string>()
+
+  return {
+    start(input) {
+      activeTurns.delete(input.key)
+      ignoredTurns.delete(input.key)
+      if (input.ignored) {
+        ignoredTurns.add(input.key)
+        return
+      }
+      activeTurns.set(input.key, { prompt: input.prompt, startedAt: input.now })
+    },
+    finish(key) {
+      if (ignoredTurns.delete(key)) return undefined
+      const turn = activeTurns.get(key)
+      activeTurns.delete(key)
+      if (!turn) return undefined
+      return { ...turn, remainingActiveTurns: activeTurns.size }
+    },
+    activeCount() {
+      return activeTurns.size
+    },
+  }
+}
+
+export function createCmuxTurnTrackerForTest(): CmuxTurnTracker {
+  return createTurnTracker()
 }
 
 function readConfig(env: NodeJS.ProcessEnv = process.env): CmuxIntegrationConfig {
@@ -53,21 +99,20 @@ function sessionKey(ctx: ExtensionContext) {
 }
 
 export default function cmuxIntegration(pi: ExtensionAPI) {
-  const activePrompts = new Map<string, string>()
-  const activeStarts = new Map<string, number>()
+  const turnTracker = createTurnTracker()
   const config = readConfig()
 
   pi.on('before_agent_start', async (event, ctx) => {
     const key = sessionKey(ctx)
-    if (!isCmuxEnvironment() || shouldIgnoreTurn(ctx, event.prompt, config)) {
-      activePrompts.delete(key)
-      activeStarts.delete(key)
+    if (!isCmuxEnvironment()) {
+      turnTracker.finish(key)
       return undefined
     }
 
+    const ignored = shouldIgnoreTurn(ctx, event.prompt, config)
     const preview = truncatePreview(event.prompt)
-    activePrompts.set(key, preview)
-    activeStarts.set(key, Date.now())
+    turnTracker.start({ key, prompt: preview, ignored, now: Date.now() })
+    if (ignored) return undefined
     const status = config.includePromptPreviewInStatus ? `Running: ${truncatePreview(event.prompt, 48)}` : 'Running'
     void setCmuxStatus(pi, config.statusKey, status, { icon: 'sparkles', color: '#3b82f6', signal: ctx.signal })
     return undefined
@@ -75,23 +120,16 @@ export default function cmuxIntegration(pi: ExtensionAPI) {
 
   pi.on('agent_end', async (_event, ctx) => {
     const key = sessionKey(ctx)
-    if (!isCmuxEnvironment() || (!config.includeSubagents && isSubagentSession(ctx))) {
-      activePrompts.delete(key)
-      activeStarts.delete(key)
-      return
+    const finished = turnTracker.finish(key)
+    if (!isCmuxEnvironment() || !finished) return
+
+    const elapsed = Math.max(1, Math.round((Date.now() - finished.startedAt) / 1000))
+    if (finished.remainingActiveTurns === 0) {
+      void setCmuxStatus(pi, config.statusKey, `Idle (${elapsed}s)`, { icon: 'check', color: '#34c759', signal: ctx.signal })
     }
 
-    const prompt = activePrompts.get(key)
-    const startedAt = activeStarts.get(key)
-    activePrompts.delete(key)
-    activeStarts.delete(key)
-
-    const elapsed = startedAt ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : undefined
-    const idleText = elapsed ? `Idle (${elapsed}s)` : 'Idle'
-    void setCmuxStatus(pi, config.statusKey, idleText, { icon: 'check', color: '#34c759', signal: ctx.signal })
-
     if (config.notifyDone) {
-      const body = prompt ? `Finished: ${prompt}` : 'Agent finished and is ready for your next message.'
+      const body = finished.prompt ? `Finished: ${finished.prompt}` : 'Agent finished and is ready for your next message.'
       void notifyCmuxDone(pi, elapsed ? `${body}\nElapsed: ${elapsed}s` : body, {
         title: 'Pi',
         subtitle: 'Done',
