@@ -17,5 +17,5 @@ jobs:
       - uses: ./.github/actions/publish-package
         with:
           package-dir: packages/web-tools
-          package-name: @catdaemon/pi-web-tools
+          package-name: "@catdaemon/pi-web-tools"
           tag-prefix: web-tools-v

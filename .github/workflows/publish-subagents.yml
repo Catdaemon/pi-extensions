@@ -17,5 +17,5 @@ jobs:
       - uses: ./.github/actions/publish-package
         with:
           package-dir: packages/subagents
-          package-name: @catdaemon/pi-subagents
+          package-name: "@catdaemon/pi-subagents"
           tag-prefix: subagents-v

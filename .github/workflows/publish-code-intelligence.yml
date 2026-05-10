@@ -17,5 +17,5 @@ jobs:
       - uses: ./.github/actions/publish-package
         with:
           package-dir: packages/code-intelligence
-          package-name: @catdaemon/pi-code-intelligence
+          package-name: "@catdaemon/pi-code-intelligence"
           tag-prefix: code-intelligence-v

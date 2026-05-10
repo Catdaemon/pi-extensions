@@ -17,5 +17,5 @@ jobs:
       - uses: ./.github/actions/publish-package
         with:
           package-dir: packages/todos
-          package-name: @catdaemon/pi-agent-todos
+          package-name: "@catdaemon/pi-agent-todos"
           tag-prefix: agent-todos-v

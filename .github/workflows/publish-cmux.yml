@@ -17,5 +17,5 @@ jobs:
       - uses: ./.github/actions/publish-package
         with:
           package-dir: packages/cmux
-          package-name: @catdaemon/pi-cmux
+          package-name: "@catdaemon/pi-cmux"
           tag-prefix: cmux-v

@@ -17,5 +17,5 @@ jobs:
       - uses: ./.github/actions/publish-package
         with:
           package-dir: packages/sidebar
-          package-name: @catdaemon/pi-sidebar
+          package-name: "@catdaemon/pi-sidebar"
           tag-prefix: pi-sidebar-v
