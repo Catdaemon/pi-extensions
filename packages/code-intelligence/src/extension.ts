@@ -34,6 +34,7 @@ import { captureCorrectionLearning, createOrReuseLearning } from './pi/correctio
 import { rewriteLearningCandidateWithModel } from './pi/learningRewrite.ts'
 import { normalizeReviewFeedbackAction, buildLearningCandidateFromReviewFeedback } from './pi/reviewFeedback.ts'
 import { findSourceTestCounterparts, retrievePlanningContextPack, formatPlanningContextMessage } from './pi/planningIntegration.ts'
+import { buildPlanCommandPrompt } from './pi/planCommand.ts'
 import { improveModeInstructions, renderImproveCodeIntelligenceContext, resolveImproveChangedFiles, retrieveImproveCodeIntelligence, selectWholeRepoReviewFiles, stripImproveFlags, type ImproveCodeIntelligenceResult } from './pi/improveIntegration.ts'
 import { ensureCodeIntelligenceInstall, formatInstallStatus } from './lifecycle/install.ts'
 import { CodeIntelligenceProgressWidget } from './pi/progressWidget.ts'
@@ -660,6 +661,25 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
     pi.sendUserMessage(buildReviewBatchActionPrompt(selections))
     ctx.ui.notify(`Queued ${selected.length} review action(s).`, 'info')
   }
+
+  pi.registerCommand('plan', {
+    description: 'Interview, research, and produce a stress-tested implementation prompt without editing files.',
+    handler: async (args, ctx) => {
+      await ctx.waitForIdle()
+      const task = args.trim()
+      let contextPack
+      let warning
+      const resolvedRuntime = await ensureRuntimeForCwd(ctx.cwd, ctx)
+      if (resolvedRuntime.runtime && task) {
+        contextPack = await retrievePlanningContextPack(resolvedRuntime.runtime, task)
+      } else {
+        warning = resolvedRuntime.warning
+      }
+      const prompt = buildPlanCommandPrompt({ task, contextPack, warning })
+      if (ctx.hasUI) ctx.ui.notify('Plan mode queued. The agent will research, interview, and produce an implementation prompt.', 'info')
+      pi.sendUserMessage(prompt)
+    },
+  })
 
   pi.registerCommand('code-intelligence-review', {
     description: 'Run a graph-aware code intelligence review of current git changes and queue a structured review report.',
