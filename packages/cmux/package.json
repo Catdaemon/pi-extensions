@@ -1,6 +1,6 @@
 {
   "name": "@catdaemon/pi-cmux",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "cmux status and notification integration for Pi.",
   "type": "module",
   "keywords": ["pi-package", "pi", "cmux", "notifications"],
