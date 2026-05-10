@@ -1,0 +1,30 @@
+{
+  "name": "@catdaemon/pi-subagents",
+  "version": "0.1.0",
+  "description": "Persistent subagent tools and UI for Pi.",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "subagents", "agent-tools"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Catdaemon/pi-extensions",
+    "directory": "packages/subagents"
+  },
+  "homepage": "https://github.com/Catdaemon/pi-extensions/tree/main/packages/subagents#readme",
+  "bugs": { "url": "https://github.com/Catdaemon/pi-extensions/issues" },
+  "pi": { "extensions": ["./index.ts"] },
+  "files": ["index.ts", "src", "README.md", "LICENSE", "package.json", "tsconfig.json"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/tests/*.test.ts",
+    "pack:dry-run": "npm pack --dry-run --ignore-scripts",
+    "prepack": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

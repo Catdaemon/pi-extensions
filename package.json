@@ -1,0 +1,36 @@
+{
+  "name": "pi-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "pack:dry-run": "pnpm -r run pack:dry-run",
+    "ci": "pnpm run typecheck && pnpm run test && pnpm run pack:dry-run"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@google/genai",
+      "better-sqlite3",
+      "esbuild",
+      "koffi",
+      "onnxruntime-node",
+      "protobufjs",
+      "sharp"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.74.0",
+    "@earendil-works/pi-ai": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.14.0",
+    "drizzle-kit": "^0.31.10",
+    "tsx": "^4.20.3",
+    "typebox": "^1.1.38",
+    "typescript": "^5.8.3"
+  }
+}

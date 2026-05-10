@@ -1,0 +1,32 @@
+{
+  "name": "@catdaemon/pi-agent-todos",
+  "version": "0.1.0",
+  "description": "Conversation todo tools, prompt guidance, and status sidebar for Pi.",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "todos", "agent-tools"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Catdaemon/pi-extensions",
+    "directory": "packages/todos"
+  },
+  "homepage": "https://github.com/Catdaemon/pi-extensions/tree/main/packages/todos#readme",
+  "bugs": { "url": "https://github.com/Catdaemon/pi-extensions/issues" },
+  "pi": { "extensions": ["./index.ts"] },
+  "files": ["index.ts", "src", "README.md", "LICENSE", "package.json", "tsconfig.json"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/tests/*.test.ts",
+    "pack:dry-run": "npm pack --dry-run --ignore-scripts",
+    "prepack": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@catdaemon/pi-sidebar": "workspace:*"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
