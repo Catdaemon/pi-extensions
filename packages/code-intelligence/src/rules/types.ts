@@ -5,6 +5,7 @@ export type MachineRuleKind =
   | 'required_test_path'
   | 'forbidden_dependency'
   | 'required_wrapper'
+  | 'duplicate_added_text'
 
 export type MachineRuleSeverity = 'error' | 'warning' | 'info'
 export type MachineRuleStatus = 'active' | 'disabled'

@@ -15,6 +15,7 @@ import { findActiveFilePaths, findMissingActiveFilePaths, getFileIndexStats, mar
 import { markFullIndexCompleted, markIncrementalIndexCompleted, updateIndexProgress } from '../db/repositories/indexingStateRepo.ts'
 import { embedChunksIncremental } from '../embeddings/embeddingIndexer.ts'
 import type { EmbeddingService } from '../embeddings/EmbeddingService.ts'
+import { yieldToEventLoop } from '../lib/async.ts'
 import type { CodeIntelligenceLogger } from '../logger.ts'
 import type { RepoIdentity } from '../repo/identifyRepo.ts'
 import { packageKeyForPath } from '../repo/packageDetection.ts'
@@ -361,6 +362,10 @@ export class IndexScheduler {
           await sleep(WORKER_PROCESS_POLL_MS)
           continue
         }
+        if (!ownerPid) {
+          await sleep(WORKER_PROCESS_POLL_MS)
+          continue
+        }
         await rm(lockDir, { recursive: true, force: true })
       }
     }
@@ -448,24 +453,20 @@ export async function runIncrementalIndex(
   })
 
   const insertedChunksForEmbedding: InsertedChunk[] = []
-  let changedFiles = 0
-  let skippedUnchanged = 0
-  let skippedIgnored = 0
-  let chunksIndexed = 0
-  let entitiesExtracted = 0
-  let relationshipsExtracted = 0
+  const stats = { changedFiles: 0, skippedUnchanged: 0, skippedIgnored: 0, chunksIndexed: 0, entitiesExtracted: 0, relationshipsExtracted: 0 }
 
   const dependencyRefreshCandidates = collectDependencyRefreshCandidates(options.db, options.identity.repoKey, changedPaths, deletedPaths)
   const scannedFiles: ScannedFile[] = []
   const deleteSet = new Set(deletedPaths)
-  updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'scanning', filesScanned: 0, startedAt })
+  const progress = new ProgressThrottler(options)
+  progress.force({ phase: 'scanning', filesScanned: 0, startedAt })
   for (const path of changedPaths) {
-    updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'scanning', currentPath: path, filesScanned: scannedFiles.length, startedAt })
+    progress.maybe({ phase: 'scanning', currentPath: path, filesScanned: scannedFiles.length, startedAt }, scannedFiles.length)
     try {
       const scanned = await scanSingleFile(options.identity.gitRoot, path, options.config)
       if (scanned) scannedFiles.push(scanned)
       else {
-        skippedIgnored += 1
+        stats.skippedIgnored += 1
         deleteSet.add(path)
       }
     } catch (error) {
@@ -475,31 +476,26 @@ export async function runIncrementalIndex(
   }
 
   const activePaths = new Set([...findActiveFilePaths(options.db, options.identity.repoKey), ...scannedFiles.map((file) => file.relativePath)].filter((path) => !deleteSet.has(path)))
-  for (let index = 0; index < scannedFiles.length; index += 1) {
-    const file = scannedFiles[index]!
-    updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'chunking', currentPath: file.relativePath, filesScanned: index + 1, startedAt })
-    const result = indexScannedFile(options, file, activePaths)
-    entitiesExtracted += result.entityCount
-    relationshipsExtracted += result.relationshipCount
-    updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'graph extraction', currentPath: file.relativePath, filesScanned: index + 1, entitiesExtracted, relationshipsExtracted, startedAt })
-    if (result.skippedUnchanged) skippedUnchanged += 1
-    else {
-      changedFiles += 1
-      chunksIndexed += result.insertedChunks.length
-      insertedChunksForEmbedding.push(...result.insertedChunks)
-    }
-    if (index % 10 === 9) await yieldToEventLoop()
+  const batchSize = Math.max(1, options.config.indexing.transactionBatchSize)
+  for (let batchStart = 0; batchStart < scannedFiles.length; batchStart += batchSize) {
+    const batch = scannedFiles.slice(batchStart, batchStart + batchSize)
+    options.db.transaction(() => {
+      for (let offset = 0; offset < batch.length; offset += 1) {
+        const index = batchStart + offset
+        const file = batch[offset]!
+        indexIncrementalFile(options, file, activePaths, progress, index, startedAt, stats, insertedChunksForEmbedding)
+      }
+    })
+    await yieldToEventLoop()
   }
 
   const indexedChangedPaths = new Set(scannedFiles.map((file) => file.relativePath))
   const dependencyRefreshFiles = await scanDependencyRefreshFiles(options, dependencyRefreshCandidates, activePaths, indexedChangedPaths, deleteSet)
   if (dependencyRefreshFiles.length > 0) {
-    updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'graph extraction', currentPath: null, filesScanned: scannedFiles.length, entitiesExtracted, relationshipsExtracted, startedAt })
-    relationshipsExtracted += refreshCodeRelationshipsForScannedFiles({ identity: options.identity, db: options.db }, dependencyRefreshFiles)
-    updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'graph extraction', currentPath: null, filesScanned: scannedFiles.length, entitiesExtracted, relationshipsExtracted, startedAt })
+    stats.relationshipsExtracted += refreshCodeRelationshipsWithProgress(progress, scannedFiles.length, stats.entitiesExtracted, stats.relationshipsExtracted, startedAt, () => refreshCodeRelationshipsForScannedFiles({ identity: options.identity, db: options.db }, dependencyRefreshFiles))
   }
 
-  updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'embedding', currentPath: null, filesScanned: scannedFiles.length, startedAt })
+  progress.force({ phase: 'embedding', currentPath: null, filesScanned: scannedFiles.length, startedAt })
 
   let deletedFiles = 0
   const deletePaths = [...deleteSet]
@@ -516,12 +512,11 @@ export async function runIncrementalIndex(
         options.db,
         options.embeddingService,
         insertedChunksForEmbedding,
-        options.config.embedding.batchSize
+        options.config.embedding
       )
     : 0
   if (embeddingsIndexed > 0) {
-    relationshipsExtracted += refreshSimilarRelationshipsForRepo(options.db, options.identity.repoKey)
-    updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'graph extraction', currentPath: null, filesScanned: scannedFiles.length, entitiesExtracted, relationshipsExtracted, startedAt })
+    stats.relationshipsExtracted += refreshGraphWithProgress(progress, scannedFiles.length, stats.entitiesExtracted, stats.relationshipsExtracted, startedAt, () => refreshSimilarRelationshipsForRepo(options.db, options.identity.repoKey))
   }
   pruneDeletedFileRows(options.db, options.identity.repoKey, deletedFilePruneCutoff())
 
@@ -529,17 +524,50 @@ export async function runIncrementalIndex(
   markIncrementalIndexCompleted(options.db, options.identity.repoKey, completedAt)
 
   const result: IncrementalIndexResult = {
-    changedFiles,
+    changedFiles: stats.changedFiles,
     deletedFiles,
-    skippedUnchanged,
-    skippedIgnored,
-    chunksIndexed,
+    skippedUnchanged: stats.skippedUnchanged,
+    skippedIgnored: stats.skippedIgnored,
+    chunksIndexed: stats.chunksIndexed,
     embeddingsIndexed,
     startedAt,
     completedAt,
   }
   options.logger.info('incremental index completed', result)
   return result
+}
+
+type ProgressInput = Omit<Parameters<typeof updateIndexProgress>[1], 'repoKey'>
+
+class ProgressThrottler {
+  private lastUpdateAt = 0
+  private lastFileCount = 0
+
+  constructor(private readonly options: { identity: RepoIdentity; db: CodeIntelligenceDb; config: CodeIntelligenceConfig }) {}
+
+  force(input: ProgressInput): void {
+    this.lastUpdateAt = Date.now()
+    this.lastFileCount = input.filesScanned ?? this.lastFileCount
+    updateIndexProgress(this.options.db, { repoKey: this.options.identity.repoKey, ...input })
+  }
+
+  maybe(input: ProgressInput, fileCount: number): void {
+    const now = Date.now()
+    if (fileCount - this.lastFileCount < this.options.config.indexing.progressFileInterval && now - this.lastUpdateAt < this.options.config.indexing.progressIntervalMs) return
+    this.force(input)
+  }
+
+  reportGraphExtraction(file: ScannedFile, index: number, entitiesExtracted: number, relationshipsExtracted: number, startedAt: string): void {
+    this.maybe({ phase: 'graph extraction', currentPath: file.relativePath, filesScanned: index + 1, entitiesExtracted, relationshipsExtracted, startedAt }, index)
+  }
+
+  forceGraphExtraction(filesScanned: number, entitiesExtracted: number, relationshipsExtracted: number, startedAt: string): void {
+    this.force({ phase: 'graph extraction', currentPath: null, filesScanned, entitiesExtracted, relationshipsExtracted, startedAt })
+  }
+}
+
+function reportChunking(progress: ProgressThrottler, file: ScannedFile, index: number, startedAt: string): void {
+  progress.maybe({ phase: 'chunking', currentPath: file.relativePath, filesScanned: index + 1, startedAt }, index)
 }
 
 function markDeletedPaths(db: CodeIntelligenceDb, repoKey: string, paths: string[]): number {
@@ -593,6 +621,91 @@ function deleteGraphForFilePaths(db: CodeIntelligenceDb, repoKey: string, paths:
   deleteEntitiesForFilePaths(db, repoKey, paths)
 }
 
+type CommonIndexStats = { entitiesExtracted: number; relationshipsExtracted: number; chunksIndexed: number; skippedUnchanged: number }
+type IncrementalIndexStats = CommonIndexStats & { changedFiles: number }
+type FullIndexStats = CommonIndexStats & { insertedOrChanged: number }
+
+function indexIncrementalFile(
+  options: Parameters<typeof indexScannedFile>[0],
+  file: ScannedFile,
+  activePaths: Set<string>,
+  progress: ProgressThrottler,
+  index: number,
+  startedAt: string,
+  stats: IncrementalIndexStats,
+  insertedChunksForEmbedding: InsertedChunk[]
+): void {
+  indexAndApplyResult(options, file, activePaths, progress, index, startedAt, stats, insertedChunksForEmbedding, () => { stats.changedFiles += 1 })
+}
+
+function indexFullFile(
+  options: Parameters<typeof indexScannedFile>[0],
+  file: ScannedFile,
+  activePaths: Set<string>,
+  progress: ProgressThrottler,
+  index: number,
+  startedAt: string,
+  stats: FullIndexStats,
+  changedScannedFiles: ScannedFile[],
+  insertedChunksForEmbedding: InsertedChunk[]
+): void {
+  indexAndApplyResult(options, file, activePaths, progress, index, startedAt, stats, insertedChunksForEmbedding, () => {
+    stats.insertedOrChanged += 1
+    changedScannedFiles.push(file)
+  })
+}
+
+function indexAndApplyResult(
+  options: Parameters<typeof indexScannedFile>[0],
+  file: ScannedFile,
+  activePaths: Set<string>,
+  progress: ProgressThrottler,
+  index: number,
+  startedAt: string,
+  stats: CommonIndexStats,
+  insertedChunksForEmbedding: InsertedChunk[],
+  onChanged: () => void
+): void {
+  applyIndexResult(indexScannedFileWithProgress(options, file, activePaths, progress, index, startedAt, stats), stats, insertedChunksForEmbedding, onChanged)
+}
+
+function applyIndexResult(result: ReturnType<typeof indexScannedFile>, stats: CommonIndexStats, insertedChunksForEmbedding: InsertedChunk[], onChanged: () => void): void {
+  stats.entitiesExtracted += result.entityCount
+  stats.relationshipsExtracted += result.relationshipCount
+  if (result.skippedUnchanged) stats.skippedUnchanged += 1
+  else {
+    onChanged()
+    stats.chunksIndexed += result.insertedChunks.length
+    insertedChunksForEmbedding.push(...result.insertedChunks)
+  }
+}
+
+function indexScannedFileWithProgress(
+  options: Parameters<typeof indexScannedFile>[0],
+  file: ScannedFile,
+  activePaths: Set<string>,
+  progress: ProgressThrottler,
+  index: number,
+  startedAt: string,
+  previous: Pick<CommonIndexStats, 'entitiesExtracted' | 'relationshipsExtracted'>
+): ReturnType<typeof indexScannedFile> {
+  reportChunking(progress, file, index, startedAt)
+  const result = indexScannedFile(options, file, activePaths)
+  progress.reportGraphExtraction(file, index, previous.entitiesExtracted + result.entityCount, previous.relationshipsExtracted + result.relationshipCount, startedAt)
+  return result
+}
+
+function refreshGraphWithProgress(progress: ProgressThrottler, filesScanned: number, entitiesExtracted: number, relationshipsExtracted: number, startedAt: string, refresh: () => number): number {
+  const added = refresh()
+  progress.forceGraphExtraction(filesScanned, entitiesExtracted, relationshipsExtracted + added, startedAt)
+  return added
+}
+
+function refreshCodeRelationshipsWithProgress(progress: ProgressThrottler, filesScanned: number, entitiesExtracted: number, relationshipsExtracted: number, startedAt: string, refresh: () => number): number {
+  progress.forceGraphExtraction(filesScanned, entitiesExtracted, relationshipsExtracted, startedAt)
+  return refreshGraphWithProgress(progress, filesScanned, entitiesExtracted, relationshipsExtracted, startedAt, refresh)
+}
+
 function indexScannedFile(
   options: {
     identity: RepoIdentity
@@ -643,6 +756,28 @@ function indexScannedFile(
   return { skippedUnchanged: false, insertedChunks: replaceChunksForFile(options.db, result.id, chunks), entityCount: entities.length, relationshipCount: fileRelationships.length + codeRelationships.length }
 }
 
+function collectFullRelationshipRefreshFiles(
+  options: { identity: RepoIdentity; db: CodeIntelligenceDb; config: CodeIntelligenceConfig },
+  scannedFiles: ScannedFile[],
+  changedFiles: ScannedFile[],
+  activePaths: Set<string>
+): ScannedFile[] {
+  if (options.config.indexing.fullRelationshipRefresh === 'disabled') return []
+  if (options.config.indexing.fullRelationshipRefresh === 'all') return scannedFiles
+
+  const byPath = new Map(scannedFiles.map((file) => [file.relativePath, file]))
+  const refreshPaths = new Set(changedFiles.map((file) => file.relativePath))
+  for (const path of refreshPaths) {
+    for (const rel of listIncomingFileRelationshipsForPath(options.db, options.identity.repoKey, path)) {
+      if (activePaths.has(rel.sourcePath)) refreshPaths.add(rel.sourcePath)
+    }
+    for (const rel of listIncomingCodeRelationshipsForPath(options.db, options.identity.repoKey, path)) {
+      if (activePaths.has(rel.sourcePath)) refreshPaths.add(rel.sourcePath)
+    }
+  }
+  return [...refreshPaths].flatMap((path) => byPath.get(path) ?? [])
+}
+
 function refreshCodeRelationshipsForScannedFiles(
   options: { identity: RepoIdentity; db: CodeIntelligenceDb },
   files: ScannedFile[]
@@ -668,74 +803,35 @@ export async function runFullRepoIndex(options: {
 }, reason = 'manual'): Promise<FullIndexResult> {
   const startedAt = new Date().toISOString()
   options.logger.info('full repo index started', { repoKey: options.identity.repoKey, reason })
-  updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'scanning', filesScanned: 0, startedAt })
+  const progress = new ProgressThrottler(options)
+  progress.force({ phase: 'scanning', filesScanned: 0, startedAt })
 
   const scan = await scanRepoFiles(options.identity.gitRoot, options.config)
   const seenPaths = new Set<string>()
-  let insertedOrChanged = 0
-  let skippedUnchanged = 0
-  let generated = 0
-  let chunksIndexed = 0
-  let entitiesExtracted = 0
+  const stats = { insertedOrChanged: 0, skippedUnchanged: 0, generated: 0, chunksIndexed: 0, entitiesExtracted: 0, relationshipsExtracted: 0 }
   const insertedChunksForEmbedding: InsertedChunk[] = []
+  const changedScannedFiles: ScannedFile[] = []
 
   const activePaths = new Set(scan.files.map((file) => file.relativePath))
-  let relationshipsExtracted = 0
-  for (let index = 0; index < scan.files.length; index += 1) {
-    const file = scan.files[index]!
-    updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'chunking', currentPath: file.relativePath, filesScanned: index + 1, startedAt })
-    seenPaths.add(file.relativePath)
-    if (file.generated.isGenerated) generated += 1
-    const packageKey = packageKeyForPath(file.relativePath, options.config)
-    const result = upsertIndexedFile(options.db, {
-      repoKey: options.identity.repoKey,
-      packageKey,
-      path: file.relativePath,
-      language: file.language,
-      fileHash: file.fileHash,
-      sizeBytes: file.sizeBytes,
-      isGenerated: file.generated.isGenerated,
-      generatedReason: file.generated.reason,
+  const batchSize = Math.max(1, options.config.indexing.transactionBatchSize)
+  for (let batchStart = 0; batchStart < scan.files.length; batchStart += batchSize) {
+    const batch = scan.files.slice(batchStart, batchStart + batchSize)
+    options.db.transaction(() => {
+      for (let offset = 0; offset < batch.length; offset += 1) {
+        const index = batchStart + offset
+        const file = batch[offset]!
+        seenPaths.add(file.relativePath)
+        if (file.generated.isGenerated) stats.generated += 1
+        indexFullFile(options, file, activePaths, progress, index, startedAt, stats, changedScannedFiles, insertedChunksForEmbedding)
+      }
     })
-    if (result.skippedUnchanged) {
-      skippedUnchanged += 1
-    } else if (result.changed) {
-      insertedOrChanged += 1
-      updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'graph extraction', currentPath: file.relativePath, filesScanned: index + 1, startedAt })
-      const entities = extractEntitiesForFile({ repoKey: options.identity.repoKey, fileId: result.id, path: file.relativePath, packageKey, language: file.language, content: file.content })
-      const entityRows = replaceEntitiesForFile(options.db, options.identity.repoKey, file.relativePath, entities)
-      const fileRelationships = extractFileRelationshipsForFile({ repoKey: options.identity.repoKey, path: file.relativePath, content: file.content, activePaths, config: options.config })
-      replaceFileRelationshipsForFile(options.db, options.identity.repoKey, file.relativePath, fileRelationships)
-      const referencedNames = extractReferencedNamesForFile({ content: file.content, entities: entityRows })
-      const candidateEntities = findEntitiesByName(options.db, options.identity.repoKey, referencedNames, 100)
-      const codeRelationships = extractCodeRelationshipsForFile({ repoKey: options.identity.repoKey, path: file.relativePath, content: file.content, entities: entityRows, candidateEntities })
-      replaceCodeRelationshipsForFile(options.db, options.identity.repoKey, file.relativePath, codeRelationships)
-      entitiesExtracted += entities.length
-      relationshipsExtracted += fileRelationships.length + codeRelationships.length
-      updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'graph extraction', currentPath: file.relativePath, filesScanned: index + 1, entitiesExtracted, relationshipsExtracted, startedAt })
-      const chunks = chunkFile({ path: file.relativePath, language: file.language, content: file.content }).map((chunk) => ({
-        repoKey: options.identity.repoKey,
-        fileId: result.id,
-        path: file.relativePath,
-        packageKey,
-        language: file.language,
-        chunkKind: chunk.chunkKind,
-        symbolName: chunk.symbolName,
-        symbolKind: chunk.symbolKind,
-        startLine: chunk.startLine,
-        endLine: chunk.endLine,
-        content: chunk.content,
-        contentHash: chunk.contentHash,
-      }))
-      const insertedChunks = replaceChunksForFile(options.db, result.id, chunks)
-      chunksIndexed += insertedChunks.length
-      insertedChunksForEmbedding.push(...insertedChunks)
-    }
-    if (index % 10 === 9) await yieldToEventLoop()
+    await yieldToEventLoop()
   }
 
-  relationshipsExtracted += refreshCodeRelationshipsForScannedFiles({ identity: options.identity, db: options.db }, scan.files)
-  updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'graph extraction', currentPath: null, filesScanned: scan.files.length, entitiesExtracted, relationshipsExtracted, startedAt })
+  const refreshFiles = collectFullRelationshipRefreshFiles(options, scan.files, changedScannedFiles, activePaths)
+  if (refreshFiles.length > 0) {
+    stats.relationshipsExtracted += refreshGraphWithProgress(progress, scan.files.length, stats.entitiesExtracted, stats.relationshipsExtracted, startedAt, () => refreshCodeRelationshipsForScannedFiles({ identity: options.identity, db: options.db }, refreshFiles))
+  }
 
   const missingPaths = findMissingActiveFilePaths(options.db, options.identity.repoKey, seenPaths)
   const excludedActivePaths = findActiveFilePaths(options.db, options.identity.repoKey).filter((path) => !shouldIncludePath(path, options.config))
@@ -744,18 +840,17 @@ export async function runFullRepoIndex(options: {
   deleteGraphForFilePaths(options.db, options.identity.repoKey, cleanupPaths)
   deleteChunksForFilePaths(options.db, options.identity.repoKey, cleanupPaths)
   pruneDeletedFileRows(options.db, options.identity.repoKey, deletedFilePruneCutoff())
-  updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'embedding', currentPath: null, filesScanned: scan.files.length, startedAt })
+  progress.force({ phase: 'embedding', currentPath: null, filesScanned: scan.files.length, startedAt })
   const embeddingsIndexed = options.embeddingService
     ? await embedChunksIncremental(
         options.db,
         options.embeddingService,
         insertedChunksForEmbedding,
-        options.config.embedding.batchSize
+        options.config.embedding
       )
     : 0
   if (embeddingsIndexed > 0) {
-    relationshipsExtracted += refreshSimilarRelationshipsForRepo(options.db, options.identity.repoKey)
-    updateIndexProgress(options.db, { repoKey: options.identity.repoKey, phase: 'graph extraction', currentPath: null, filesScanned: scan.files.length, entitiesExtracted, relationshipsExtracted, startedAt })
+    stats.relationshipsExtracted += refreshGraphWithProgress(progress, scan.files.length, stats.entitiesExtracted, stats.relationshipsExtracted, startedAt, () => refreshSimilarRelationshipsForRepo(options.db, options.identity.repoKey))
   }
 
   const completedAt = new Date().toISOString()
@@ -763,11 +858,11 @@ export async function runFullRepoIndex(options: {
 
   const result: FullIndexResult = {
     scanned: scan.files.length,
-    insertedOrChanged,
-    skippedUnchanged,
+    insertedOrChanged: stats.insertedOrChanged,
+    skippedUnchanged: stats.skippedUnchanged,
     deleted,
-    generated,
-    chunksIndexed,
+    generated: stats.generated,
+    chunksIndexed: stats.chunksIndexed,
     embeddingsIndexed,
     summary: scan.summary,
     startedAt,
@@ -779,7 +874,7 @@ export async function runFullRepoIndex(options: {
 
 async function readLockPid(lockDir: string): Promise<number | undefined> {
   try {
-    const value = Number.parseInt(await readFile(join(lockDir, 'pid'), 'utf8'), 10)
+    const value = Number.parseInt(await readFile(join(lockDir, 'owner-pid'), 'utf8'), 10)
     return Number.isFinite(value) ? value : undefined
   } catch {
     return undefined
@@ -793,10 +888,6 @@ function isProcessAlive(pid: number): boolean {
   } catch {
     return false
   }
-}
-
-function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolve) => setImmediate(resolve))
 }
 
 function sleep(ms: number): Promise<void> {

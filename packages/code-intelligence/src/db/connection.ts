@@ -12,8 +12,9 @@ export type CodeIntelligenceDb = BetterSQLite3Database<typeof schema> & { close:
 
 export async function openCodeIntelligenceDb(storageDir: string): Promise<CodeIntelligenceDb> {
   await mkdir(storageDir, { recursive: true })
-  const sqlite = new Database(join(storageDir, 'memory.sqlite'))
+  const sqlite = new Database(join(storageDir, 'memory.sqlite'), { timeout: 10_000 })
   sqlite.pragma('journal_mode = WAL')
+  sqlite.pragma('busy_timeout = 10000')
   sqlite.pragma('foreign_keys = ON')
   const db = drizzle(sqlite, { schema }) as unknown as CodeIntelligenceDb
   db.close = () => sqlite.close()
@@ -24,8 +25,9 @@ export async function openCodeIntelligenceDb(storageDir: string): Promise<CodeIn
 export async function openCodeIntelligenceGlobalDb(env: NodeJS.ProcessEnv = process.env): Promise<CodeIntelligenceDb> {
   const dataDir = resolveCodeIntelligenceDataDir(env)
   await mkdir(dataDir, { recursive: true })
-  const sqlite = new Database(join(dataDir, 'global.sqlite'))
+  const sqlite = new Database(join(dataDir, 'global.sqlite'), { timeout: 10_000 })
   sqlite.pragma('journal_mode = WAL')
+  sqlite.pragma('busy_timeout = 10000')
   sqlite.pragma('foreign_keys = ON')
   const db = drizzle(sqlite, { schema }) as unknown as CodeIntelligenceDb
   db.close = () => sqlite.close()

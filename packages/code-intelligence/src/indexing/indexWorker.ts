@@ -40,6 +40,12 @@ async function main(): Promise<void> {
         status: service.status,
         activeModel: service.modelId,
         activeDimensions: service.dimensions,
+        activeDevice: service.activeDevice,
+        downloadStatus: service.downloadStatus,
+        downloadFile: service.downloadFile,
+        downloadLoadedBytes: service.downloadLoadedBytes,
+        downloadTotalBytes: service.downloadTotalBytes,
+        downloadProgress: service.downloadProgress,
         cacheDir: resolveModelCacheDir(),
         lastError: service.lastError,
       })
@@ -58,7 +64,7 @@ async function main(): Promise<void> {
       db,
       embeddingService,
       payload.identity.repoKey,
-      payload.config.embedding.batchSize,
+      payload.config.embedding,
       1000
     )
     result.embeddingsIndexed += backfilledEmbeddings

@@ -63,6 +63,68 @@ describe('machine-checkable rules', () => {
     }
   })
 
+  it('does not generate required_test_path for source-file scoped testing learnings', async () => {
+    const { db, storage } = await setupDb()
+    try {
+      createLearning(db, 'rules-repo', {
+        title: 'Hydrate auth stores safely',
+        summary: 'For zustand persist stores with a hydrated gate, ensure onRehydrateStorage marks hydration complete even when storage rehydration errors or state is unavailable.',
+        ruleType: 'testing_convention',
+        appliesWhen: 'When editing auth store hydration behavior.',
+        prefer: 'tests around src/store/authStore.ts hydration behavior',
+        pathGlobs: ['src/store/authStore.ts'],
+        confidence: 1,
+        priority: 80,
+        status: 'active',
+      })
+      assert.equal(listMachineRules(db, 'rules-repo', 'active').length, 0)
+    } finally {
+      db.close()
+      await rm(storage, { recursive: true, force: true })
+    }
+  })
+
+  it('does not infer required_test_path from source/test wording', async () => {
+    const { db, storage } = await setupDb()
+    try {
+      createLearning(db, 'rules-repo', {
+        title: 'Prompt convention tests should cover review requirements',
+        summary: 'Prompt convention tests should assert durable review requirements, such as source/test counterpart checks, when prompt behavior depends on those requirements.',
+        ruleType: 'testing_convention',
+        appliesWhen: 'When changing prompt behavior.',
+        prefer: 'Add or update prompt convention tests that assert durable review requirements, including source/test counterpart checks when relevant.',
+        confidence: 1,
+        priority: 80,
+        status: 'active',
+      })
+      assert.equal(listMachineRules(db, 'rules-repo', 'active').length, 0)
+    } finally {
+      db.close()
+      await rm(storage, { recursive: true, force: true })
+    }
+  })
+
+  it('does not infer required_test_path from learning scope globs alone', async () => {
+    const { db, storage } = await setupDb()
+    try {
+      createLearning(db, 'rules-repo', {
+        title: 'Review behavior contracts',
+        summary: 'When reviewing runtime changes, check producer and consumer output contracts and error paths.',
+        ruleType: 'testing_convention',
+        appliesWhen: 'When reviewing runtime behavior changes.',
+        prefer: 'tests that exercise the changed behavior',
+        pathGlobs: ['tests/smoke/**'],
+        confidence: 1,
+        priority: 80,
+        status: 'active',
+      })
+      assert.equal(listMachineRules(db, 'rules-repo', 'active').length, 0)
+    } finally {
+      db.close()
+      await rm(storage, { recursive: true, force: true })
+    }
+  })
+
   it('does not create hard rules for draft or low-confidence learnings', async () => {
     const { db, storage } = await setupDb()
     try {

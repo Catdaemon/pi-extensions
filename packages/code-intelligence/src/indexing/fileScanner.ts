@@ -4,6 +4,7 @@ import type { CodeIntelligenceConfig } from '../config.ts'
 import { detectGeneratedFile, type GeneratedDetection } from './generated.ts'
 import { matchesAnyGlob, normalizeRelativePath } from './glob.ts'
 import { sha256Buffer } from './hash.ts'
+import { yieldToEventLoop } from '../lib/async.ts'
 import { detectLanguage, isLikelyBinaryBuffer, isLikelyBinaryPath } from './language.ts'
 
 export type ScannedFile = {
@@ -42,21 +43,7 @@ export async function scanSingleFile(
 
   const fileStat = await stat(absolutePath)
   if (!fileStat.isFile()) return undefined
-  if (fileStat.size > config.maxFileBytes) return undefined
-
-  const buffer = await readFile(absolutePath)
-  if (isLikelyBinaryBuffer(buffer)) return undefined
-
-  const content = buffer.toString('utf8')
-  return {
-    absolutePath,
-    relativePath: normalizeRelativePath(relative(repoRoot, absolutePath)),
-    language: detectLanguage(normalizedRelativePath),
-    fileHash: sha256Buffer(buffer),
-    sizeBytes: fileStat.size,
-    content,
-    generated: detectGeneratedFile(normalizedRelativePath, content, config),
-  }
+  return scanKnownFile(repoRoot, normalizedRelativePath, absolutePath, fileStat.size, config)
 }
 
 export async function scanRepoFiles(repoRoot: string, config: CodeIntelligenceConfig): Promise<ScanResult> {
@@ -70,10 +57,11 @@ export async function scanRepoFiles(repoRoot: string, config: CodeIntelligenceCo
   }
 
   let visitedEntries = 0
-  await walkDirectory(repoRoot, '', config, files, summary, () => {
+  await walkDirectory(repoRoot, '', config, files, summary, createScanLimiter(config.indexing.scanConcurrency), () => {
     visitedEntries += 1
     return visitedEntries
   })
+  files.sort((a, b) => a.relativePath.localeCompare(b.relativePath))
   return { files, summary }
 }
 
@@ -94,6 +82,7 @@ async function walkDirectory(
   config: CodeIntelligenceConfig,
   files: ScannedFile[],
   summary: ScanSummary,
+  scanLimiter: ScanLimiter,
   nextVisitedCount: () => number
 ): Promise<void> {
   const absoluteDir = join(repoRoot, relativeDir)
@@ -109,7 +98,7 @@ async function walkDirectory(
         summary.skippedIgnored += 1
         continue
       }
-      await walkDirectory(repoRoot, relativePath, config, files, summary, nextVisitedCount)
+      await walkDirectory(repoRoot, relativePath, config, files, summary, scanLimiter, nextVisitedCount)
       continue
     }
 
@@ -134,18 +123,65 @@ async function walkDirectory(
       continue
     }
 
-    const scanned = await scanSingleFile(repoRoot, relativePath, config)
-    if (!scanned) {
-      summary.skipped += 1
-      summary.skippedBinary += 1
-      continue
-    }
+    void scanLimiter.run(async () => {
+      const scanned = await scanKnownFile(repoRoot, relativePath, absolutePath, fileStat.size, config)
+      if (!scanned) {
+        summary.skipped += 1
+        summary.skippedBinary += 1
+        return
+      }
+      files.push(scanned)
+      summary.scanned += 1
+    })
+  }
 
-    files.push(scanned)
-    summary.scanned += 1
+  await scanLimiter.drain()
+}
+
+type ScanLimiter = {
+  run<T>(task: () => Promise<T>): Promise<T>
+  drain(): Promise<void>
+}
+
+function createScanLimiter(concurrency: number): ScanLimiter {
+  const limit = Math.max(1, Math.trunc(concurrency || 1))
+  const active = new Set<Promise<unknown>>()
+
+  return {
+    async run<T>(task: () => Promise<T>): Promise<T> {
+      while (active.size >= limit) await Promise.race(active)
+      const promise = task().finally(() => active.delete(promise))
+      active.add(promise)
+      return promise
+    },
+    async drain(): Promise<void> {
+      while (active.size > 0) await Promise.all([...active])
+    },
   }
 }
 
-function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolve) => setImmediate(resolve))
+async function scanKnownFile(
+  repoRoot: string,
+  relativePath: string,
+  absolutePath: string,
+  sizeBytes: number,
+  config: CodeIntelligenceConfig
+): Promise<ScannedFile | undefined> {
+  if (sizeBytes > config.maxFileBytes) return undefined
+
+  const buffer = await readFile(absolutePath)
+  if (isLikelyBinaryBuffer(buffer)) return undefined
+
+  const normalizedRelativePath = normalizeRelativePath(relativePath)
+  const content = buffer.toString('utf8')
+  return {
+    absolutePath,
+    relativePath: normalizeRelativePath(relative(repoRoot, absolutePath)),
+    language: detectLanguage(normalizedRelativePath),
+    fileHash: sha256Buffer(buffer),
+    sizeBytes,
+    content,
+    generated: detectGeneratedFile(normalizedRelativePath, content, config),
+  }
 }
+

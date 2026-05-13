@@ -1,5 +1,6 @@
 import type { CodeEntityRow } from '../db/repositories/entitiesRepo.ts'
 import type { CodeRelationshipInput } from '../db/repositories/relationshipsRepo.ts'
+import { splitLines } from '../lib/text.ts'
 import { extractImportsForFile } from './entityExtractor.ts'
 
 const RESERVED_CALLS = new Set(['if', 'for', 'while', 'switch', 'catch', 'return', 'function', 'typeof', 'await', 'new'])
@@ -110,10 +111,3 @@ function pushRelationship(
   })
 }
 
-function splitLines(content: string): string[] {
-  const normalized = content.replace(/\r\n/g, '\n')
-  if (normalized.length === 0) return []
-  const lines = normalized.split('\n')
-  if (lines.at(-1) === '') lines.pop()
-  return lines
-}

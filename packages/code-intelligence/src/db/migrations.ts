@@ -275,6 +275,32 @@ export const DRIZZLE_MIGRATIONS: DrizzleMigration[] = [
       `CREATE INDEX IF NOT EXISTS idx_file_relationships_kind ON file_relationships(repo_key, kind)`,
     ],
   },
+  {
+    id: 4,
+    name: 'embedding_active_device',
+    statements: [
+      `ALTER TABLE embedding_status ADD COLUMN active_device TEXT`,
+    ],
+  },
+  {
+    id: 5,
+    name: 'embedding_download_progress',
+    statements: [
+      `ALTER TABLE embedding_status ADD COLUMN download_status TEXT`,
+      `ALTER TABLE embedding_status ADD COLUMN download_file TEXT`,
+      `ALTER TABLE embedding_status ADD COLUMN download_loaded_bytes INTEGER`,
+      `ALTER TABLE embedding_status ADD COLUMN download_total_bytes INTEGER`,
+      `ALTER TABLE embedding_status ADD COLUMN download_progress INTEGER`,
+    ],
+  },
+  {
+    id: 6,
+    name: 'embedding_throughput_eta',
+    statements: [
+      `ALTER TABLE embedding_status ADD COLUMN embedding_rate_per_second INTEGER`,
+      `ALTER TABLE embedding_status ADD COLUMN embedding_eta_seconds INTEGER`,
+    ],
+  },
 ]
 
 export function runDrizzleMigrations(db: CodeIntelligenceDb): void {

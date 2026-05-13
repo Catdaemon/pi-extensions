@@ -1,3 +1,4 @@
+import { splitLines } from '../../lib/text.ts'
 import type { RawEntity } from './types.ts'
 
 export function extractFallbackEntities(path: string, content: string, language?: string): RawEntity[] {
@@ -13,10 +14,3 @@ export function extractFallbackEntities(path: string, content: string, language?
   return []
 }
 
-function splitLines(content: string): string[] {
-  const normalized = content.replace(/\r\n/g, '\n')
-  if (normalized.length === 0) return []
-  const lines = normalized.split('\n')
-  if (lines.at(-1) === '') lines.pop()
-  return lines
-}

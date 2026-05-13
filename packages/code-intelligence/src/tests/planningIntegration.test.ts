@@ -11,9 +11,12 @@ import {
 import type { ContextPack } from '../retrieval/contextPack.ts'
 
 describe('planning integration request construction', () => {
-  it('detects non-trivial code-change prompts and ignores trivial prompts', () => {
+  it('detects non-trivial code-change and behavior-tracing prompts while ignoring trivial prompts', () => {
     assert.equal(shouldRetrievePlanningContext('Add a new invoice filter endpoint'), true)
     assert.equal(shouldRetrievePlanningContext('Fix failing tests in src/routes/invoices.ts'), true)
+    assert.equal(shouldRetrievePlanningContext('How often does the app refresh the job list?'), true)
+    assert.equal(shouldRetrievePlanningContext('Where is route polling configured?'), true)
+    assert.equal(shouldRetrievePlanningContext('What controls React Query invalidation for jobs?'), true)
     assert.equal(shouldRetrievePlanningContext('looks good'), false)
     assert.equal(shouldRetrievePlanningContext('ok'), false)
   })

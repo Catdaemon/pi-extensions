@@ -1,3 +1,4 @@
+import { isTestRequirementPattern } from '../lib/pathClassifiers.ts'
 import type { CodebaseLearning } from '../learnings/types.ts'
 import type { MachineRule } from './types.ts'
 
@@ -74,8 +75,15 @@ function forbiddenPathPatterns(learning: CodebaseLearning): string[] {
 
 function requiredTestPatternForLearning(learning: CodebaseLearning): string | undefined {
   if (learning.ruleType !== 'testing_convention') return undefined
-  const path = learning.pathGlobs?.[0] ?? extractPath(learning.prefer) ?? extractPath(learning.summary)
-  return path ? normalizeDirectoryPattern(path) : undefined
+  const path = extractExplicitTestRequirementPath(learning.prefer) ?? extractExplicitTestRequirementPath(learning.summary)
+  if (!path || !isTestRequirementPattern(path)) return undefined
+  return normalizeDirectoryPattern(path)
+}
+
+function extractExplicitTestRequirementPath(value: string | undefined): string | undefined {
+  if (!value) return undefined
+  if (!/\b(add|write|include|create|under|in)\s+(?:\w+\s+){0,4}tests?\b/i.test(value)) return undefined
+  return extractPath(value)
 }
 
 function normalizePackageName(value: string): string {
@@ -103,3 +111,4 @@ function extractPath(value: string | undefined): string | undefined {
   const match = /((?:[\w.-]+\/)+[\w.@*/-]+|[\w.-]+\/\*\*)/.exec(value)
   return match?.[1]
 }
+

@@ -1,3 +1,4 @@
+import { splitLines } from '../../lib/text.ts'
 import type { ExtractedImport, RawEntity } from './types.ts'
 
 export function extractTypeScriptEntities(path: string, content: string): RawEntity[] {
@@ -141,13 +142,6 @@ function stripStrings(line: string): string {
   return line.replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '')
 }
 
-function splitLines(content: string): string[] {
-  const normalized = content.replace(/\r\n/g, '\n')
-  if (normalized.length === 0) return []
-  const lines = normalized.split('\n')
-  if (lines.at(-1) === '') lines.pop()
-  return lines
-}
 
 function dedupeEntities(entities: RawEntity[]): RawEntity[] {
   const seen = new Set<string>()

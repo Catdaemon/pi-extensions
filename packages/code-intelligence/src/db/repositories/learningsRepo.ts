@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { and, desc, eq, inArray, or, sql } from 'drizzle-orm'
+import { and, desc, eq, or, sql } from 'drizzle-orm'
 import type { CodeIntelligenceDb } from '../connection.ts'
 import { learnings } from '../schema.ts'
 import type { CodebaseLearning, LearningCandidate, LearningStatus, RetrievedLearning } from '../../learnings/types.ts'
@@ -124,29 +124,40 @@ export function retrieveLearningFts(db: CodeIntelligenceDb, input: { repoKey: st
 
 export function markLearningsUsed(db: CodeIntelligenceDb, learningIds: string[], usedAt = new Date().toISOString()): void {
   if (learningIds.length === 0) return
-  db.transaction((tx) => {
-    for (const id of new Set(learningIds)) {
-      const before = tx.select({ repoKey: learnings.repoKey, confidence: learnings.confidence, priority: learnings.priority }).from(learnings).where(and(eq(learnings.id, id), eq(learnings.status, 'active'))).get()
-      const result = tx
-        .update(learnings)
-        .set({
-          lastUsedAt: usedAt,
-          updatedAt: usedAt,
-          confidence: sql`MIN(1, ${learnings.confidence} + 0.01)`,
-          priority: sql`MIN(100, ${learnings.priority} + 1)`,
-        })
-        .where(and(eq(learnings.id, id), eq(learnings.status, 'active')))
-        .run()
-      if (before && result.changes > 0) {
-        appendLearningEvent(tx as unknown as CodeIntelligenceDb, {
-          repoKey: before.repoKey,
-          learningId: id,
-          eventKind: 'retrieved',
-          payload: { confidenceBefore: before.confidence, priorityBefore: before.priority },
-        })
+  try {
+    db.transaction((tx) => {
+      for (const id of new Set(learningIds)) {
+        const before = tx.select({ repoKey: learnings.repoKey, confidence: learnings.confidence, priority: learnings.priority }).from(learnings).where(and(eq(learnings.id, id), eq(learnings.status, 'active'))).get()
+        const result = tx
+          .update(learnings)
+          .set({
+            lastUsedAt: usedAt,
+            updatedAt: usedAt,
+            confidence: sql`MIN(1, ${learnings.confidence} + 0.01)`,
+            priority: sql`MIN(100, ${learnings.priority} + 1)`,
+          })
+          .where(and(eq(learnings.id, id), eq(learnings.status, 'active')))
+          .run()
+        if (before && result.changes > 0) {
+          appendLearningEvent(tx as unknown as CodeIntelligenceDb, {
+            repoKey: before.repoKey,
+            learningId: id,
+            eventKind: 'retrieved',
+            payload: { confidenceBefore: before.confidence, priorityBefore: before.priority },
+          })
+        }
       }
-    }
-  })
+    })
+  } catch (error) {
+    if (isDatabaseLockedError(error)) return
+    throw error
+  }
+}
+
+export function isDatabaseLockedError(error: unknown): boolean {
+  const code = (error as { code?: unknown })?.code
+  const message = error instanceof Error ? error.message : String(error)
+  return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED' || /database is (?:locked|busy)/i.test(message)
 }
 
 export function upsertLearningFts(db: CodeIntelligenceDb, learning: CodebaseLearning): void {

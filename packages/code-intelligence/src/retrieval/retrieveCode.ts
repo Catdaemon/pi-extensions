@@ -3,6 +3,7 @@ import { getChunksByIds, getChunksForPaths, retrieveChunksFts, type ChunkRow } f
 import { listChunkEmbeddingsForRepo } from '../db/repositories/embeddingsRepo.ts'
 import type { EmbeddingService } from '../embeddings/EmbeddingService.ts'
 import { cosineSimilarity } from '../embeddings/vector.ts'
+import { isTestPath } from '../lib/pathClassifiers.ts'
 import { mergeHybridResults } from './hybridRank.ts'
 
 export type RetrievalReason =
@@ -59,13 +60,13 @@ export async function retrieveCodeVector(
   request: RetrieveCodeRequest
 ): Promise<RetrievedCodeChunk[]> {
   if (embeddingService.status === 'fts_only' || embeddingService.status === 'failed') return []
+  let queryVector: number[] | undefined
   try {
     await embeddingService.ensureReady()
+    ;[queryVector] = await embeddingService.embedTexts([request.query])
   } catch {
     return []
   }
-
-  const [queryVector] = await embeddingService.embedTexts([request.query])
   if (!queryVector) return []
 
   const embeddings = listChunkEmbeddingsForRepo(db, request.repoKey)
@@ -127,6 +128,7 @@ function chunkRowToRetrieved(
 
   const uniqueReasons = [...new Set(reasons)]
   const workingSetBoost = uniqueReasons.length > new Set(baseReasons).size ? 0.15 * (uniqueReasons.length - new Set(baseReasons).size) : 0
+  const rankingAdjustment = retrievalRankingAdjustment(row, request.query)
   return {
     id: row.id,
     path: row.path,
@@ -138,7 +140,33 @@ function chunkRowToRetrieved(
     startLine: row.start_line,
     endLine: row.end_line,
     content: row.content,
-    score: baseScore + workingSetBoost,
+    score: baseScore + workingSetBoost + rankingAdjustment,
     reasons: uniqueReasons,
   }
+}
+
+export function retrievalRankingAdjustment(row: Pick<ChunkRow, 'path' | 'chunk_kind' | 'symbol_kind'>, query: string): number {
+  if (!isImplementationQuery(query)) return 0
+  const path = row.path.toLowerCase()
+  let adjustment = 0
+  if (isDocumentationPath(path)) adjustment -= 0.22
+  if (isTestPath(path)) adjustment -= 0.1
+  if (isImplementationPath(path)) adjustment += 0.12
+  if (row.symbol_kind && row.symbol_kind !== 'heading') adjustment += 0.06
+  if (row.chunk_kind === 'markdown') adjustment -= 0.08
+  return adjustment
+}
+
+function isImplementationQuery(query: string): boolean {
+  const lower = query.toLowerCase()
+  if (/\b(readme|docs?|documentation|guide|usage|overview)\b/.test(lower)) return false
+  return /\b(where|how|built|implemented?|implementation|code|function|class|method|call|calls|prompt|review|graph|context|changed files?|handler|command|tool|worker|index(?:ed|er|ing)?|retriev(?:e|al)|rank(?:ing)?)\b/.test(lower)
+}
+
+function isDocumentationPath(path: string): boolean {
+  return path.endsWith('.md') || path.includes('/docs/') || path.includes('/readme')
+}
+
+function isImplementationPath(path: string): boolean {
+  return /(^|\/)src\//.test(path) && !isTestPath(path) && !isDocumentationPath(path)
 }

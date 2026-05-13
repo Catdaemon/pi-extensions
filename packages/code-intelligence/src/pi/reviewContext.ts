@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext } from '@earendil-works/pi-coding-agent'
-import { loadConfig, type CodeIntelligenceConfig, type ReviewConfigRule } from '../config.ts'
+import { CHEAP_REVIEW_PASSES, DEFAULT_MODEL_REVIEW_PASSES, REVIEW_PASSES, loadConfig, type CodeIntelligenceConfig, type ReviewConfigRule, type ReviewModelRoutingConfig, type ReviewPass } from '../config.ts'
 import { minimatch } from 'minimatch'
 import { closeCodeIntelligenceDb, openCodeIntelligenceDb } from '../db/connection.ts'
 import { retrieveHardRules } from '../db/repositories/rulesRepo.ts'
@@ -10,15 +10,14 @@ import { isCodeIntelligenceEnabled } from '../repo/enabledRepos.ts'
 import { packageKeyForPath } from '../repo/packageDetection.ts'
 import { resolveRepoStorageDir } from '../repo/storage.ts'
 import { buildContextPack, type ContextPack } from '../retrieval/contextPack.ts'
+import { formatDiffReviewWarnings, reviewDiffWithCodebaseDryChecks } from '../review/reviewDiff.ts'
 import { formatGraphContextSummary, retrieveReviewContext, type GraphFileSummary } from '../retrieval/graphContext.ts'
 import { retrieveCodeHybrid, type RetrievedCodeChunk } from '../retrieval/retrieveCode.ts'
 import { retrieveLearningsHybrid } from '../retrieval/retrieveLearnings.ts'
 import { CodeIntelligenceLogger } from '../logger.ts'
 import { extractMentionedFilePaths, findSourceTestCounterparts } from './planningIntegration.ts'
 
-export type ImproveMode = 'default' | 'changed' | 'review' | 'tests' | 'conventions' | 'package'
-
-export type ImproveSelectedScope = {
+export type ReviewSelectedScope = {
   mode: 'git_changes' | 'branch_diff' | 'whole_directory'
   repoRoot?: string
   branch?: string
@@ -28,21 +27,35 @@ export type ImproveSelectedScope = {
   details: string
 }
 
-export type ImproveReviewConfigContext = {
+export type ReviewConfigContext = {
   filesLoaded: string[]
   errors: string[]
   matchingRules: ReviewConfigRule[]
+  modelRouting: ReviewModelRoutingConfig
 }
 
-export type ImproveChangedRange = {
+export type CurrentModelRef = {
+  provider?: string
+  id?: string
+}
+
+export type ResolvedReviewModelRouting = {
+  currentModel?: string
+  strategy: ReviewModelRoutingConfig['strategy']
+  allowCrossProvider: boolean
+  models: Partial<Record<ReviewPass | 'default', string>>
+  notes: string[]
+}
+
+export type ReviewChangedRange = {
   startLine: number
   endLine: number
   addedLines: number
 }
 
-export type ImproveReviewPacket = {
+export type ReviewPacket = {
   file: string
-  changedRanges: ImproveChangedRange[]
+  changedRanges: ReviewChangedRange[]
   changedDeclarations: Array<{ name: string; kind: string; startLine: number }>
   graphSummary?: GraphFileSummary
   relatedFiles: string[]
@@ -52,66 +65,43 @@ export type ImproveReviewPacket = {
   relevantSnippets: Array<{ path: string; startLine: number; endLine: number; symbolName?: string; reasons: string[] }>
 }
 
-export type ImproveCodeIntelligenceResult = {
+export type ReviewCodeIntelligenceResult = {
   enabled: boolean
   repoKey?: string
   contextPack?: ContextPack
   graphContext?: GraphFileSummary[]
-  reviewPackets?: ImproveReviewPacket[]
-  reviewConfig?: ImproveReviewConfigContext
-  mode: ImproveMode
+  reviewPackets?: ReviewPacket[]
+  reviewConfig?: ReviewConfigContext
+  reviewWarnings?: string
+  indexedAnalysis?: string
   changedFiles: string[]
   warning?: string
 }
 
-const IMPROVE_FLAGS: Array<{ flag: string; mode: ImproveMode }> = [
-  { flag: 'changed', mode: 'changed' },
-  { flag: 'review', mode: 'review' },
-  { flag: 'tests', mode: 'tests' },
-  { flag: 'conventions', mode: 'conventions' },
-  { flag: 'package', mode: 'package' },
-]
-
-function improveFlagPattern(flag: string): RegExp {
-  return new RegExp(`(?:^|\\s)--${flag}(?=\\s|$)`, 'g')
+export function normalizeReviewFocus(args: string): string {
+  return args.trim().replace(/\s+/g, ' ')
 }
 
-export function parseImproveMode(args: string): ImproveMode {
-  for (const { flag, mode } of IMPROVE_FLAGS) {
-    if (improveFlagPattern(flag).test(args)) return mode
-  }
-  return 'default'
-}
-
-export function stripImproveFlags(args: string): string {
-  let stripped = args
-  for (const { flag } of IMPROVE_FLAGS) {
-    stripped = stripped.replace(improveFlagPattern(flag), ' ')
-  }
-  return stripped.trim().replace(/\s+/g, ' ')
-}
-
-export async function retrieveImproveCodeIntelligence(input: {
+export async function retrieveReviewCodeIntelligence(input: {
   pi: ExtensionAPI
   ctx: ExtensionCommandContext
-  scope: ImproveSelectedScope
+  scope: ReviewSelectedScope
   args: string
   onProgress?: (message: string) => void
-}): Promise<ImproveCodeIntelligenceResult> {
-  const mode = parseImproveMode(input.args)
-  const focus = stripImproveFlags(input.args)
+}): Promise<ReviewCodeIntelligenceResult> {
+  const focus = normalizeReviewFocus(input.args)
   let changedFiles: string[] = []
-  let changedRangesByFile = new Map<string, ImproveChangedRange[]>()
+  let changedRangesByFile = new Map<string, ReviewChangedRange[]>()
 
   try {
     input.onProgress?.('identifying repo')
     const identity = await identifyRepo(input.scope.repoRoot ?? input.ctx.cwd)
     input.onProgress?.('reading git diff')
-    changedFiles = await resolveImproveChangedFiles(input.pi, input.ctx, input.scope)
-    changedRangesByFile = await resolveImproveChangedRanges(input.pi, input.ctx, input.scope)
+    changedFiles = await resolveReviewChangedFiles(input.pi, input.scope)
+    changedRangesByFile = await resolveReviewChangedRanges(input.pi, input.scope)
 
     if (!(await isCodeIntelligenceEnabled(identity.repoKey))) {
-      return { enabled: false, repoKey: identity.repoKey, mode, changedFiles, warning: 'Code intelligence is disabled for this repo.' }
+      return { enabled: false, repoKey: identity.repoKey, changedFiles, warning: 'Code intelligence is disabled for this repo.' }
     }
 
     input.onProgress?.('opening index')
@@ -126,14 +116,13 @@ export async function retrieveImproveCodeIntelligence(input: {
       const currentFiles = [...new Set([...changedFiles, ...mentionedFiles, ...wholeRepoFiles])]
       const counterpartFiles = findSourceTestCounterparts(currentFiles, config)
       const packageKey = currentFiles.map((path) => packageKeyForPath(path, config)).find(Boolean)
-      const query = buildImproveQuery({ scope: input.scope, focus, mode, changedFiles })
+      const query = buildReviewQuery({ scope: input.scope, focus, changedFiles })
       const embeddingService = new TransformersEmbeddingService(config, new CodeIntelligenceLogger())
-      const baseMaxCodeChunks = mode === 'conventions' ? Math.max(4, Math.floor(config.maxCodeChunks / 2)) : config.maxCodeChunks
-      const maxCodeChunks = mode === 'review' ? Math.max(baseMaxCodeChunks, Math.max(24, currentFiles.length * 3)) : baseMaxCodeChunks
+      const maxCodeChunks = Math.max(config.maxCodeChunks, Math.max(24, currentFiles.length * 3))
       input.onProgress?.('retrieving code context')
       const codeContext = mergeRetrievedCodeChunks(
         await Promise.all(
-          buildImproveQueries({ baseQuery: query, focus, changedFiles, mode }).map((retrievalQuery) =>
+          buildReviewQueries({ baseQuery: query, focus, changedFiles }).map((retrievalQuery) =>
             retrieveCodeHybrid(db, embeddingService, {
               repoKey: identity.repoKey,
               query: retrievalQuery,
@@ -146,14 +135,21 @@ export async function retrieveImproveCodeIntelligence(input: {
             })
           )
         ),
-        Math.max(maxCodeChunks, mode === 'default' ? 18 : maxCodeChunks)
+        maxCodeChunks
       )
+      input.onProgress?.('running diff preflight checks')
+      const diffText = await resolveReviewDiff(input.pi, input.scope)
+      const diffReview = diffText.trim()
+        ? await reviewDiffWithCodebaseDryChecks(db, { repoKey: identity.repoKey, diff: diffText, embeddingService })
+        : undefined
+      const reviewWarnings = diffReview && diffReview.warnings.length > 0 ? formatDiffReviewWarnings(diffReview) : undefined
+
       input.onProgress?.('retrieving learnings and rules')
       const learnings = await retrieveLearningsHybrid(db, embeddingService, {
         repoKey: identity.repoKey,
         query,
         packageKey,
-        maxLearnings: mode === 'tests' ? Math.max(config.maxLearnings, 10) : config.maxLearnings,
+        maxLearnings: config.maxLearnings,
       })
       const hardRules = retrieveHardRules(db, identity.repoKey)
       input.onProgress?.('building graph review context')
@@ -166,7 +162,8 @@ export async function retrieveImproveCodeIntelligence(input: {
       const graphContext = reviewContext.summaries
 
       const reviewPackets = buildReviewPackets(currentFiles, graphContext, codeContext, changedRangesByFile)
-      const reviewConfig = buildImproveReviewConfigContext(config, currentFiles)
+      const reviewConfig = buildReviewConfigContext(config, currentFiles)
+      const indexedAnalysis = formatIndexedChangeAnalysis({ changedFiles: currentFiles, reviewPackets, graphContext, reviewWarnings })
 
       input.onProgress?.('formatting review context')
       const contextPack = buildContextPack({
@@ -180,40 +177,41 @@ export async function retrieveImproveCodeIntelligence(input: {
       })
 
       input.onProgress?.('ready')
-      return { enabled: true, repoKey: identity.repoKey, contextPack, graphContext, reviewPackets, reviewConfig, mode, changedFiles }
+      return { enabled: true, repoKey: identity.repoKey, contextPack, graphContext, reviewPackets, reviewConfig, reviewWarnings, indexedAnalysis, changedFiles }
     } finally {
       closeCodeIntelligenceDb(db)
     }
   } catch (error) {
     return {
       enabled: false,
-      mode,
       changedFiles,
       warning: `Code intelligence context retrieval failed: ${(error as Error).message}`,
     }
   }
 }
 
-export function renderImproveCodeIntelligenceContext(result: ImproveCodeIntelligenceResult): string {
+export function renderReviewCodeIntelligenceContext(result: ReviewCodeIntelligenceResult): string {
   if (!result.enabled || !result.contextPack) {
     const reason = result.warning ?? 'Code intelligence is not enabled for this repo.'
-    return `# Code Intelligence Context\n\n${reason} /improve should rely on the selected scope and normal project context only.`
+    return `# Code Intelligence Context\n\n${reason} Review should rely on the selected scope and normal project context only.`
   }
 
   return [
     '# Code Intelligence Context',
-    `Mode: ${result.mode}`,
+    `Scope: review`,
     `Changed files: ${result.changedFiles.length > 0 ? result.changedFiles.join(', ') : '(none detected)'}`,
     `Freshness: index=${result.contextPack.freshness.indexState}, embeddings=${result.contextPack.freshness.embeddingState}`,
     '',
     result.contextPack.promptText,
+    result.reviewWarnings ? ['## Diff Preflight Warnings', result.reviewWarnings].join('\n\n') : '',
+    result.indexedAnalysis ?? '',
     result.graphContext && result.graphContext.length > 0 ? formatGraphContextSummary(result.graphContext) : '',
     result.reviewPackets && result.reviewPackets.length > 0 ? formatReviewPackets(result.reviewPackets) : '',
-    result.reviewConfig ? formatImproveReviewConfigContext(result.reviewConfig) : '',
+    result.reviewConfig ? formatReviewConfigContext(result.reviewConfig) : '',
   ].join('\n')
 }
 
-export function buildImproveReviewConfigContext(config: CodeIntelligenceConfig, files: string[]): ImproveReviewConfigContext {
+export function buildReviewConfigContext(config: CodeIntelligenceConfig, files: string[]): ReviewConfigContext {
   const uniqueFiles = [...new Set(files)]
   const matchingRules = config.review.rules.filter((rule) => {
     if (!rule.scope || rule.scope.length === 0) return true
@@ -223,10 +221,11 @@ export function buildImproveReviewConfigContext(config: CodeIntelligenceConfig, 
     filesLoaded: config.review.status.filesLoaded,
     errors: config.review.status.errors,
     matchingRules,
+    modelRouting: config.review.modelRouting,
   }
 }
 
-export function formatImproveReviewConfigContext(context: ImproveReviewConfigContext): string {
+export function formatReviewConfigContext(context: ReviewConfigContext): string {
   if (context.filesLoaded.length === 0 && context.errors.length === 0 && context.matchingRules.length === 0) return ''
   const lines = ['## Repo-local Review Config']
   lines.push(`Loaded: ${context.filesLoaded.length > 0 ? context.filesLoaded.join(', ') : '(none)'}`)
@@ -241,15 +240,113 @@ export function formatImproveReviewConfigContext(context: ImproveReviewConfigCon
       lines.push(`- [${rule.severity}] ${rule.id}${scope}: ${rule.instruction}`)
     }
   }
+  const modelRouting = context.modelRouting ?? { strategy: 'same-family-cheap' as const, allowCrossProvider: false, models: {} }
+  if (modelRouting.strategy !== 'same-family-cheap' || modelRouting.allowCrossProvider || Object.keys(modelRouting.models).length > 0) {
+    lines.push(`Review model routing: strategy=${modelRouting.strategy}, allowCrossProvider=${modelRouting.allowCrossProvider}`)
+  }
   return lines.join('\n')
+}
+
+export function resolveReviewModelRouting(config: ReviewModelRoutingConfig | undefined, currentModel: CurrentModelRef | undefined): ResolvedReviewModelRouting {
+  const routing = config ?? { strategy: 'same-family-cheap' as const, allowCrossProvider: false, models: {} }
+  const currentModelName = formatCurrentModelRef(currentModel)
+  const rawCurrentProvider = currentModel?.provider ?? currentModelName?.split('/')[0]
+  const currentProvider = normalizeProvider(rawCurrentProvider)
+  const notes: string[] = []
+  const explicitDefault = safeExplicitModel(routing.models.default, currentProvider, routing.allowCrossProvider, notes, 'default')
+  const models: ResolvedReviewModelRouting['models'] = {}
+
+  if (routing.strategy === 'inherit') {
+    notes.push('No subagent model overrides; all passes inherit the current session model.')
+    return { currentModel: currentModelName, strategy: routing.strategy, allowCrossProvider: routing.allowCrossProvider, models, notes }
+  }
+
+  for (const pass of REVIEW_PASSES) {
+    const explicit = safeExplicitModel(routing.models[pass], currentProvider, routing.allowCrossProvider, notes, pass)
+    if (explicit) models[pass] = explicit
+    else if (routing.strategy === 'explicit' && explicitDefault) models[pass] = explicitDefault
+  }
+
+  if (routing.strategy === 'same-family-cheap') {
+    const cheapModel = sameFamilyCheapModel(rawCurrentProvider, currentProvider, currentModel?.id ?? currentModelName)
+    for (const pass of CHEAP_REVIEW_PASSES) {
+      if (!models[pass] && cheapModel) models[pass] = cheapModel
+    }
+    for (const pass of DEFAULT_MODEL_REVIEW_PASSES) {
+      if (!models[pass] && explicitDefault) models[pass] = explicitDefault
+    }
+    if (!cheapModel && currentProvider) notes.push(`No known cheap same-family model for provider ${currentProvider}; unset passes inherit current model.`)
+  }
+
+  return { currentModel: currentModelName, strategy: routing.strategy, allowCrossProvider: routing.allowCrossProvider, models, notes }
+}
+
+export function formatReviewModelRoutingForPrompt(routing: ResolvedReviewModelRouting): string {
+  const lines = [
+    'Review model routing:',
+    `- Current session model: ${routing.currentModel ?? 'unknown/default'}`,
+    `- Strategy: ${routing.strategy}; allowCrossProvider=${routing.allowCrossProvider}`,
+  ]
+  const entries = Object.entries(routing.models).filter(([, model]) => Boolean(model))
+  if (entries.length === 0) lines.push('- Model overrides: none; omit task.model so subagents inherit the current model.')
+  else {
+    lines.push('- Model overrides to use when creating subagent tasks:')
+    for (const [pass, model] of entries) lines.push(`  - ${pass}: ${model}`)
+  }
+  for (const note of routing.notes) lines.push(`- Note: ${note}`)
+  lines.push('- Never choose a cross-provider model unless allowCrossProvider=true or that exact pass model is explicitly configured and allowed.')
+  lines.push('- For any pass not listed above, omit task.model rather than guessing.')
+  return lines.join('\n')
+}
+
+function formatCurrentModelRef(model: CurrentModelRef | undefined): string | undefined {
+  if (!model?.provider && !model?.id) return undefined
+  return model.provider && model.id ? `${model.provider}/${model.id}` : model.id ?? model.provider
+}
+
+function normalizeProvider(provider: string | undefined): string | undefined {
+  if (!provider) return undefined
+  const lower = provider.toLowerCase()
+  if (lower.includes('openai')) return 'openai'
+  if (lower.includes('anthropic') || lower.includes('claude')) return 'anthropic'
+  if (lower.includes('google') || lower.includes('gemini')) return 'google'
+  if (lower.includes('openrouter')) return 'openrouter'
+  if (lower.includes('xai') || lower.includes('grok')) return 'xai'
+  return lower
+}
+
+function safeExplicitModel(model: string | undefined, currentProvider: string | undefined, allowCrossProvider: boolean, notes: string[], pass: string): string | undefined {
+  if (!model) return undefined
+  const provider = normalizeProvider(model.includes('/') ? model.split('/')[0] : currentProvider)
+  if (!allowCrossProvider && currentProvider && provider && provider !== currentProvider) {
+    notes.push(`Ignored ${pass} model ${model} because it is outside current provider ${currentProvider}.`)
+    return undefined
+  }
+  return model
+}
+
+function sameFamilyCheapModel(rawProvider: string | undefined, normalizedProvider: string | undefined, currentModelId: string | undefined): string | undefined {
+  const current = currentModelId?.toLowerCase() ?? ''
+  const provider = rawProvider?.trim() || normalizedProvider
+  if (!provider) return undefined
+  // Preserve subscription/custom provider ids while swapping only the model id. For example,
+  // openai-codex/gpt-5.5 should route cheap passes to openai-codex/gpt-4.1-mini.
+  if (normalizedProvider === 'openai') {
+    if (provider.toLowerCase() === 'openai-codex') return current.includes('gpt-5.4-mini') ? undefined : `${provider}/gpt-5.4-mini`
+    return current.includes('gpt-4.1-mini') || current.includes('gpt-4o-mini') ? undefined : `${provider}/gpt-4.1-mini`
+  }
+  if (normalizedProvider === 'anthropic') return current.includes('haiku') ? undefined : `${provider}/claude-3-5-haiku-latest`
+  if (normalizedProvider === 'google') return current.includes('flash') ? undefined : `${provider}/gemini-2.5-flash`
+  if (normalizedProvider === 'xai') return current.includes('mini') ? undefined : `${provider}/grok-3-mini`
+  return undefined
 }
 
 export function buildReviewPackets(
   files: string[],
   graphContext: GraphFileSummary[] = [],
   codeContext: RetrievedCodeChunk[] = [],
-  changedRangesByFile: Map<string, ImproveChangedRange[]> = new Map()
-): ImproveReviewPacket[] {
+  changedRangesByFile: Map<string, ReviewChangedRange[]> = new Map()
+): ReviewPacket[] {
   const graphByPath = new Map(graphContext.map((summary) => [summary.path, summary]))
   return [...new Set(files)].map((file) => {
     const graphSummary = graphByPath.get(file)
@@ -287,7 +384,31 @@ export function buildReviewPackets(
   })
 }
 
-export function formatReviewPackets(packets: ImproveReviewPacket[]): string {
+export function formatIndexedChangeAnalysis(input: {
+  changedFiles: string[]
+  reviewPackets?: ReviewPacket[]
+  graphContext?: GraphFileSummary[]
+  reviewWarnings?: string
+}): string {
+  const packets = input.reviewPackets ?? []
+  if (input.changedFiles.length === 0 && packets.length === 0 && !input.reviewWarnings) return ''
+  const lines = ['## Indexed Change Analysis']
+  lines.push('- Contract/API risk: check exported changed declarations, callers/imported-by, route/screens, schema/type changes, and downstream tests before accepting compatibility.')
+  lines.push('- Review coverage: every changed file should be accounted for; files with callers, similar implementations, or missing counterparts need explicit verification or a stated non-test rationale.')
+  lines.push('- Local patterns: compare changed code against similar files/snippets and prefer existing helpers, schemas, factories, middleware, and conventions over new ad-hoc code.')
+  lines.push('- Test quality: counterpart tests should exercise observable behavior, failure modes, integration contracts, and regressions rather than static config/object shape.')
+  lines.push('- Implementation planning: inspect impacted callers/callees/routes/tests before editing, and add validation for high-risk changed behavior.')
+  const risky = packets.filter((packet) => packet.changedDeclarations.some((item) => packet.graphSummary?.declarations.find((declaration) => declaration.name === item.name)?.exported) || (packet.graphSummary?.importedBy.length ?? 0) > 0 || (packet.graphSummary?.calledBy.length ?? 0) > 0)
+  if (risky.length > 0) lines.push(`- High-impact changed files: ${risky.map((packet) => packet.file).slice(0, 8).join(', ')}`)
+  const missingTests = packets.filter((packet) => packet.testStatus === 'missing_candidate').map((packet) => packet.file)
+  if (missingTests.length > 0) lines.push(`- Missing/unknown test counterparts: ${missingTests.slice(0, 8).join(', ')}`)
+  const similar = packets.filter((packet) => (packet.graphSummary?.similar.length ?? 0) > 0).map((packet) => `${packet.file} -> ${packet.graphSummary!.similar.slice(0, 3).join(', ')}`)
+  if (similar.length > 0) lines.push('- Similar local patterns to compare:', ...similar.slice(0, 6).map((item) => `  - ${item}`))
+  if (input.reviewWarnings?.trim()) lines.push('- Preflight warnings must be verified or dismissed in coverage.')
+  return lines.join('\n')
+}
+
+export function formatReviewPackets(packets: ReviewPacket[]): string {
   const lines = ['## Per-file Review Packets', '', '| File | Changed areas | Graph context to inspect | Test/counterpart status | Relevant snippets | Review focus |', '| --- | --- | --- | --- | --- | --- |']
   for (const packet of packets) {
     const graphParts = packet.graphSummary ? [
@@ -311,7 +432,7 @@ export function formatReviewPackets(packets: ImproveReviewPacket[]): string {
   return lines.join('\n')
 }
 
-export type ImproveFinding = {
+export type ReviewFinding = {
   id: string
   file: string
   startLine?: number
@@ -361,7 +482,7 @@ export function buildReviewReportTemplate(): string {
 
 export function buildStructuredReviewRequirements(): string {
   return [
-    'Structured /improve --review report requirements:',
+    'Structured /code-intelligence-review report requirements:',
     '- Do not edit files in review mode.',
     '- Use the exact report shape below so findings, coverage, and readiness are machine-scannable.',
     '- Start with a findings summary grouped by severity P0/P1/P2/P3.',
@@ -377,19 +498,7 @@ export function buildStructuredReviewRequirements(): string {
   ].join('\n')
 }
 
-export function improveModeInstructions(mode: ImproveMode): string[] {
-  if (mode === 'review') return [
-    'Run in review-only mode: identify improvement opportunities, but do not edit files unless the user explicitly asks in a follow-up.',
-    buildStructuredReviewRequirements(),
-  ]
-  if (mode === 'tests') return ['Focus especially on missing, weak, or inconsistent tests. Prefer source/test counterpart patterns from code intelligence.']
-  if (mode === 'conventions') return ['Focus especially on local codebase learnings, hard rules, and consistency with retrieved local patterns.']
-  if (mode === 'package') return ['Prefer package-level patterns and avoid broad repo-wide refactors outside the package scope.']
-  if (mode === 'changed') return ['Focus on currently changed files and their source/test counterparts.']
-  return []
-}
-
-export async function resolveImproveChangedFiles(pi: ExtensionAPI, ctx: ExtensionCommandContext, scope: ImproveSelectedScope): Promise<string[]> {
+export async function resolveReviewChangedFiles(pi: ExtensionAPI, scope: ReviewSelectedScope): Promise<string[]> {
   if (!scope.repoRoot) return []
   const args = scope.mode === 'branch_diff' && scope.baseRef ? ['diff', '--name-only', `${scope.baseRef}...HEAD`, '--'] : ['diff', '--name-only', 'HEAD', '--']
   const result = await pi.exec('git', ['-C', scope.repoRoot, ...args], { timeout: 10_000 })
@@ -407,7 +516,16 @@ function parseGitPathLines(text: string): string[] {
     .filter(Boolean)
 }
 
-async function resolveImproveChangedRanges(pi: ExtensionAPI, ctx: ExtensionCommandContext, scope: ImproveSelectedScope): Promise<Map<string, ImproveChangedRange[]>> {
+async function resolveReviewDiff(pi: ExtensionAPI, scope: ReviewSelectedScope): Promise<string> {
+  if (!scope.repoRoot) return ''
+  const diffArgs = scope.mode === 'branch_diff' && scope.baseRef
+    ? [['diff', '--no-ext-diff', `${scope.baseRef}...HEAD`, '--']]
+    : [['diff', '--no-ext-diff', '--cached', '--'], ['diff', '--no-ext-diff', '--']]
+  const results = await Promise.all(diffArgs.map((args) => pi.exec('git', ['-C', scope.repoRoot!, ...args], { timeout: 10_000 })))
+  return results.map((result) => result.stdout ?? '').join('\n')
+}
+
+async function resolveReviewChangedRanges(pi: ExtensionAPI, scope: ReviewSelectedScope): Promise<Map<string, ReviewChangedRange[]>> {
   if (!scope.repoRoot) return new Map()
   const diffArgs = scope.mode === 'branch_diff' && scope.baseRef
     ? [['diff', '--unified=0', `${scope.baseRef}...HEAD`, '--']]
@@ -419,8 +537,8 @@ async function resolveImproveChangedRanges(pi: ExtensionAPI, ctx: ExtensionComma
   return mergeChangedRangeMaps(maps)
 }
 
-export function parseChangedRangesFromDiff(diff: string): Map<string, ImproveChangedRange[]> {
-  const rangesByFile = new Map<string, ImproveChangedRange[]>()
+export function parseChangedRangesFromDiff(diff: string): Map<string, ReviewChangedRange[]> {
+  const rangesByFile = new Map<string, ReviewChangedRange[]>()
   let currentFile: string | undefined
   for (const line of diff.split('\n')) {
     if (line.startsWith('diff --git ')) {
@@ -447,8 +565,8 @@ export function parseChangedRangesFromDiff(diff: string): Map<string, ImproveCha
   return rangesByFile
 }
 
-function mergeChangedRangeMaps(maps: Map<string, ImproveChangedRange[]>[]): Map<string, ImproveChangedRange[]> {
-  const merged = new Map<string, ImproveChangedRange[]>()
+function mergeChangedRangeMaps(maps: Map<string, ReviewChangedRange[]>[]): Map<string, ReviewChangedRange[]> {
+  const merged = new Map<string, ReviewChangedRange[]>()
   for (const map of maps) {
     for (const [file, ranges] of map) {
       merged.set(file, [...(merged.get(file) ?? []), ...ranges])
@@ -461,17 +579,16 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))]
 }
 
-function formatChangedRanges(ranges: ImproveChangedRange[]): string {
+function formatChangedRanges(ranges: ReviewChangedRange[]): string {
   return ranges
     .slice(0, 5)
     .map((range) => (range.startLine === range.endLine ? `L${range.startLine}` : `L${range.startLine}-L${range.endLine}`))
     .join(', ')
 }
 
-function buildImproveQuery(input: { scope: ImproveSelectedScope; focus: string; mode: ImproveMode; changedFiles: string[] }): string {
+function buildReviewQuery(input: { scope: ReviewSelectedScope; focus: string; changedFiles: string[] }): string {
   return [
-    'Improve code using local repository patterns.',
-    `Mode: ${input.mode}`,
+    'Review code using local repository patterns.',
     input.scope.summary,
     input.focus,
     input.changedFiles.join('\n'),
@@ -481,11 +598,11 @@ function buildImproveQuery(input: { scope: ImproveSelectedScope; focus: string; 
     .join('\n')
 }
 
-export function buildImproveQueries(input: { baseQuery: string; focus: string; changedFiles: string[]; mode: ImproveMode }): string[] {
+export function buildReviewQueries(input: { baseQuery: string; focus: string; changedFiles: string[] }): string[] {
   const changedFilesText = input.changedFiles.join('\n')
   const categoryQueries = [
     ['Correctness review: edge cases, error handling, lifecycle cleanup, async races, idempotency problems, and resource leaks.', input.focus, changedFilesText].join('\n'),
-    ['Test review: missing, weak, flaky, or inconsistent tests and source/test counterpart patterns.', input.focus, changedFilesText].join('\n'),
+    ['Test review: missing, weak, flaky, or inconsistent tests and source/test counterpart patterns. Flag tests-for-tests-sake that only assert configuration objects, constants, fixtures, factory output, snapshots, or mocks without exercising behavior, contracts, failure modes, or regressions.', input.focus, changedFilesText].join('\n'),
     ['Convention review: local patterns, hard rules, architectural consistency, duplicated logic, oversized files, and maintainability issues.', input.focus, changedFilesText].join('\n'),
     ['Duplication review: repeated helpers/types/components that should use existing project or dependency abstractions.', input.focus, changedFilesText].join('\n'),
     ['Resource review: large-input behavior, process/file-handle cleanup, memory growth, retries, cancellation, and partial-failure behavior.', input.focus, changedFilesText].join('\n'),
@@ -499,8 +616,6 @@ export function buildImproveQueries(input: { baseQuery: string; focus: string; c
     input.baseQuery,
     ...categoryQueries,
     ...perFileQueries,
-    input.mode === 'tests' ? ['Focus on test coverage gaps and regression tests.', input.focus, changedFilesText].join('\n') : '',
-    input.mode === 'conventions' ? ['Focus on codebase conventions, hard rules, local patterns, and consistency.', input.focus, changedFilesText].join('\n') : '',
   ].filter((query, index, array) => query.trim().length > 0 && array.indexOf(query) === index)
 }
 

@@ -1,4 +1,5 @@
 import { extname } from 'node:path'
+import { splitLines } from '../lib/text.ts'
 import { sha256Text } from './hash.ts'
 
 export type CodeChunk = {
@@ -208,10 +209,3 @@ function updateBraceDepth(line: string, current: number): number {
   return next
 }
 
-function splitLines(content: string): string[] {
-  const normalized = content.replace(/\r\n/g, '\n')
-  if (normalized.length === 0) return []
-  const lines = normalized.split('\n')
-  if (lines.at(-1) === '') lines.pop()
-  return lines
-}

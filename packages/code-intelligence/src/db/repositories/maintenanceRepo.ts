@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, sql } from 'drizzle-orm'
 import type { CodeIntelligenceDb } from '../connection.ts'
-import { chunkEmbeddings, chunks, codeEntities, codeRelationships, embeddingStatus, fileRelationships, files, learningEmbeddings, learnings, machineRules } from '../schema.ts'
+import { chunkEmbeddings, chunks, codeEntities, embeddingStatus, files, learnings, machineRules } from '../schema.ts'
 import type { CodebaseLearning } from '../../learnings/types.ts'
 import { appendLearningEvent } from './eventsRepo.ts'
 import type { LearningRow } from './learningsRepo.ts'

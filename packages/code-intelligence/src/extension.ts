@@ -13,20 +13,14 @@ import { getFileRelationshipStats } from './db/repositories/fileRelationshipsRep
 import { getEmbeddingStatus } from './db/repositories/embeddingStatusRepo.ts'
 import { getIndexingState } from './db/repositories/indexingStateRepo.ts'
 import { appendLearningEvent } from './db/repositories/eventsRepo.ts'
-import { createLearning, listLearnings, updateLearningStatus } from './db/repositories/learningsRepo.ts'
+import { listLearnings, updateLearningStatus } from './db/repositories/learningsRepo.ts'
 import type { CodebaseLearning, LearningRuleType, LearningStatus } from './learnings/types.ts'
 import {
-  consolidateSimilarLearnings,
-  findStaleLearnings,
-  forgetAllLearnings,
   forgetLearning,
   resetCodeIndex,
   resetEmbeddings,
-  supersedeLearning,
 } from './db/repositories/maintenanceRepo.ts'
-import { getMachineRuleStats, listMachineRules, retrieveHardRules } from './db/repositories/rulesRepo.ts'
-import { embedLearningIfReady } from './embeddings/learningEmbeddingIndexer.ts'
-import { extractManualLearning } from './learnings/extractLearning.ts'
+import { retrieveHardRules } from './db/repositories/rulesRepo.ts'
 import { CodeIntelligenceLogger } from './logger.ts'
 import { enableCodeIntelligenceRepo, disableCodeIntelligenceRepo, isCodeIntelligenceEnabled, listEnabledRepoRecords } from './repo/enabledRepos.ts'
 import { identifyRepo, type RepoIdentity } from './repo/identifyRepo.ts'
@@ -36,7 +30,7 @@ import { rewriteLearningCandidateWithModel } from './pi/learningRewrite.ts'
 import { normalizeReviewFeedbackAction, buildLearningCandidateFromReviewFeedback } from './pi/reviewFeedback.ts'
 import { findSourceTestCounterparts, retrievePlanningContextPack, formatPlanningContextMessage } from './pi/planningIntegration.ts'
 import { buildPlanCommandPrompt } from './pi/planCommand.ts'
-import { improveModeInstructions, renderImproveCodeIntelligenceContext, resolveImproveChangedFiles, retrieveImproveCodeIntelligence, selectWholeRepoReviewFiles, stripImproveFlags, type ImproveCodeIntelligenceResult } from './pi/improveIntegration.ts'
+import { formatIndexedChangeAnalysis, formatReviewModelRoutingForPrompt, normalizeReviewFocus, renderReviewCodeIntelligenceContext, resolveReviewChangedFiles, resolveReviewModelRouting, retrieveReviewCodeIntelligence, selectWholeRepoReviewFiles, type ReviewCodeIntelligenceResult, type ResolvedReviewModelRouting } from './pi/reviewContext.ts'
 import { ensureCodeIntelligenceInstall, formatInstallStatus } from './lifecycle/install.ts'
 import { CodeIntelligenceProgressWidget } from './pi/progressWidget.ts'
 import { CodeIntelligenceDashboardComponent } from './pi/statusTui.ts'
@@ -46,7 +40,7 @@ import { buildContextPack, type ContextPack } from './retrieval/contextPack.ts'
 import { formatGraphContextSummary, formatGraphEdgeDetails, retrieveGraphContextForFiles, retrieveGraphContextForQuery, retrieveGraphEdgeDetailsForFiles, retrieveImpactContextForDiff, type GraphEdgeDetails, type GraphFileSummary, type ImpactContext } from './retrieval/graphContext.ts'
 import { retrieveCodeHybrid } from './retrieval/retrieveCode.ts'
 import { retrieveLearningsHybrid } from './retrieval/retrieveLearnings.ts'
-import { formatDiffReviewWarnings, reviewDiff } from './review/reviewDiff.ts'
+import { formatDiffReviewWarnings, reviewDiffWithCodebaseDryChecks } from './review/reviewDiff.ts'
 import type { EmbeddingService } from './embeddings/EmbeddingService.ts'
 import { STATUS_CARD_OVERLAY_WIDTH, getStatusCardTop, isStatusCardSidebarVisible, registerStatusCard, unregisterStatusCard, updateStatusCardLayout } from '@catdaemon/pi-sidebar'
 
@@ -120,6 +114,11 @@ const codeIntelligenceImpactSchema = Type.Object({
   maxItemsPerSection: Type.Optional(Type.Number({ description: 'Maximum items per graph summary section. Defaults to 8.' })),
 })
 
+const codeIntelligenceAnalyzeChangesSchema = Type.Object({
+  paths: Type.Optional(Type.Array(Type.String(), { description: 'Changed or planned file paths to analyze. Defaults to current git changes.' })),
+  repoPath: Type.Optional(Type.String({ description: 'Optional repo/directory to analyze. Defaults to the current cwd.' })),
+})
+
 const codeIntelligenceSearchSchema = Type.Object({
 
   query: Type.String({ description: 'Natural-language or code search query for local code intelligence retrieval.' }),
@@ -173,13 +172,40 @@ const PROGRESS_UI_STATE_KEY = Symbol.for('pi-code-intelligence.progress-ui-state
 const progressUiState = ((globalThis as typeof globalThis & { [PROGRESS_UI_STATE_KEY]?: ProgressUiState })[PROGRESS_UI_STATE_KEY] ??= {
   progressOverlayInitializing: false,
 })
+const REVIEW_JSON_START = '<!-- pi-code-intelligence-review-json -->'
+const REVIEW_JSON_END = '<!-- /pi-code-intelligence-review-json -->'
+const REGRESSION_CHECK_REVIEW_GUIDANCE = 'For behavior or contract changes, name the observable behavior, the regression test that would fail before the fix, and whether changed tests really exercise it.'
+const ZERO_FINDING_CHALLENGE_REVIEW_GUIDANCE = 'Before returning no findings for a file, name the top plausible failure modes and disprove them with exact code, callers, tests, config, or runtime boundaries.'
+const LOCAL_PATTERN_REVIEW_GUIDANCE = 'Before proposing any validation, parsing, auth, data-access, API, or test fix, inspect existing local patterns: shared schemas, validators, safeParse/parse helpers, middleware, error helpers, test factories, route/service conventions, and similar implementations. Do not suggest ad-hoc validation/parsing/auth/test helpers until you have checked those patterns.'
+const AI_SLOP_REVIEW_GUIDANCE = 'Hunt AI-slop with concrete risk: duplicated logic/types/schemas, ad-hoc validation, useless guards or catch-all fake success, dead branches, over-abstraction, vague names, inconsistent patterns, hallucinated APIs/options, comments that restate code, TODOs instead of implementation, and tests-for-tests-sake such as assertions that a configuration object, constants map, fixture, or factory returns the same object shape without exercising behavior, contracts, failure modes, or regressions.'
+const SIMPLIFY_QUALITY_REVIEW_GUIDANCE = 'Check simplify/cleanup smells: stringly-typed code where constants/enums/string unions already exist; parameter sprawl instead of restructuring; redundant or derivable state; copy-paste with slight variation; leaky abstractions; nested conditionals that should be flattened; and unnecessary JSX/wrapper nesting when component props can do the job.'
+const EFFICIENCY_REVIEW_GUIDANCE = 'Check efficiency smells: unnecessary work, duplicate reads/calls/computation, missed concurrency, hot-path bloat, recurring no-op updates in polling/events/state stores, unnecessary existence pre-checks before file/resource operations, unbounded memory/listeners, and overly broad operations such as loading all data to use one item.'
+const REVIEW_OUTPUT_JSON_INSTRUCTIONS = `Finish with minimal JSON between these exact markers for the review panel; put detailed reasoning and coverage in markdown:
+${REVIEW_JSON_START}
+{"findings":[{"id":"CI-1","severity":"P2","title":"Short title","file":"path/to/file.ts","line":"L10-L12","confidence":0.8,"type":"correctness","evidence":"specific code/diff/graph evidence","suggestedFix":"smallest fix"}],"readinessScore":3}
+${REVIEW_JSON_END}
+Use valid JSON only inside the markers. If there are no findings, use an empty findings array.`
+
 const RECOVERY_POLL_MS = 3_000
 const RECOVERY_RETRY_MS = 8_000
 
-const REVIEW_JSON_START = '<!-- pi-code-intelligence-review-json -->'
-const REVIEW_JSON_END = '<!-- /pi-code-intelligence-review-json -->'
 const REVIEW_FILES_PER_WORKER = 20
 const REVIEW_MAX_CONCURRENT_WORKERS = 6
+
+const REVIEW_FOCUS_PASSES = [
+  {
+    id: 'correctness-security',
+    focus: ['correctness', 'security', 'reliability/resource', 'runtime contracts', 'error paths'],
+  },
+  {
+    id: 'tests-regression',
+    focus: ['test coverage', 'regression checks', 'source/test counterparts', 'tests-for-tests-sake'],
+  },
+  {
+    id: 'dry-conventions-ai-slop',
+    focus: ['DRY/reuse', 'local conventions', 'maintainability', 'AI-slop', 'existing abstractions'],
+  },
+] as const
 
 type ParsedReviewFinding = {
   id: string
@@ -201,46 +227,35 @@ type ParsedReviewOutput = {
   markdown: string
 }
 
-export function buildCodeIntelligenceReviewPrompt(scope: SelectedScope, extraFocus: string | undefined, intelligence: ImproveCodeIntelligenceResult): string {
-  const modeInstructions = improveModeInstructions(intelligence.mode)
+export function buildCodeIntelligenceReviewPrompt(scope: SelectedScope, extraFocus: string | undefined, intelligence: ReviewCodeIntelligenceResult): string {
   return `You are running a /code-intelligence-review pass.
 
 Act as a strict senior pre-merge reviewer. The tool has two goals: catch real bugs/security/reliability issues, and aggressively eliminate AI-slop coding patterns such as duplication, useless guards, vague abstractions, hallucinated APIs, cargo-cult defensive code, inconsistent local patterns, and untested complexity. Do not edit files in this review pass; report findings only.
 
 ${renderScopeContext(scope, extraFocus)}
 
-${renderImproveCodeIntelligenceContext(intelligence)}
+${renderReviewCodeIntelligenceContext(intelligence)}
 
-Review playbook:
-1. Inspect all changed/assigned code first. Do not sample files or stop after the first plausible issue. For every reviewed file, classify risk area: auth/session/permissions, external input/API/routes, database/storage, network/fetch/webhooks, payments/billing, PII/secrets/logging, concurrency/background jobs, UI state/lifecycle, config/build, tests-only, or low-risk utility.
-2. For every reviewed file, assess every issue category in the output schema: correctness, security, reliability/resource, performance, maintainability/convention, docs when applicable, and test coverage. Form concrete hypotheses about possible bugs, inconsistencies, missing tests, or risky AI-slop patterns. A hypothesis should name the suspected failure mode and the contract it might violate.
-3. For each plausible hypothesis, search related code and learned context before reporting it: graph edges, imports/imported-by, callers/callees, tests/counterparts, similar implementations, hard rules, and high-confidence learnings.
-4. Follow call/data chains far enough to confirm or discard the hypothesis. For high-risk files, trace untrusted inputs to sensitive sinks and check validation, authorization/ownership/tenant checks, sanitization, escaping, timeout/retry/cancellation behavior, error handling, and whether secrets/PII can leak to logs or responses.
-5. Before proposing any validation, parsing, auth, data-access, API, or test fix, inspect existing local patterns and name them in the finding: shared schemas, validators, safeParse/parse helpers, middleware, error helpers, test factories, route/service conventions, and similar implementations. Prefer the repo's existing abstraction even when an inline regex or ad-hoc helper would be the smallest functional patch. If the changed code bypasses an established pattern, report that convention violation with concrete evidence.
-6. Check cross-file contracts using graph context: caller expectations, return shapes, thrown errors, nullable/undefined behavior, schema/API changes, component props, hook lifecycle assumptions, cache invalidation, and whether tests/counterparts were updated.
-7. Check AI-slop/code-quality issues aggressively, while still requiring concrete risk. Look for: copy/pasted logic that will drift; duplicate types/schemas/validation rules; ad-hoc validation/parsing when shared schemas or local conventions exist; useless null checks or try/catch blocks that hide errors; broad catch-all handling that returns fake success; dead branches and impossible states; over-abstracted helpers that obscure simple logic; vague names like data/result/handler where domain names are needed; inconsistent patterns versus similar files; large mixed-concern files; hallucinated dependencies/APIs/options; comments that restate code; TODOs used instead of implementation; tests that only assert mocks or snapshots without behavior; and generated-looking code that bypasses repo conventions.
-8. Confirm or discard every hypothesis before final output. Report only findings that survive revalidation against guards, tests, configs, related files, documented contracts, and local implementation conventions; downgrade or omit speculative findings.
-9. For every credible P1/P2 bug/security/reliability finding, propose a concrete negative test or regression test that would fail before the fix. If no test is appropriate, explain why.
-9. Review every changed/assigned file and relevant graph/source-test context before finishing. Include a coverage row for every reviewed file, even files with no findings, and make the coverage row reflect the categories assessed rather than merely saying no findings.
-10. Report only high-signal issues, but treat confirmed AI-slop as high-signal when it increases future bug likelihood, obscures control/data flow, duplicates business rules, weakens tests, or hides failures. Avoid pure style preferences, broad rewrites, or “could be cleaner” comments without that risk tie.
-12. Suggest the smallest warranted fix for each finding. The suggested fix must cite the existing local pattern or explain that no pattern was found after checking related code.
-13. Include a readiness score from 0-5.
-14. Finish with a machine-readable JSON block between these exact markers so Pi can open an interactive review panel:
-${REVIEW_JSON_START}
-{"findings":[{"id":"CI-1","severity":"P2","title":"Short title","file":"path/to/file.ts","line":"L10-L12","confidence":0.8,"type":"correctness","riskArea":"external input/API/routes","evidence":"specific code/diff/graph evidence","dataFlow":"input -> validation -> sink, or n/a","contractsChecked":["caller path or test path"],"testsToAdd":["concrete negative/regression test"],"revalidation":"why this is still valid after checking guards/tests/contracts","suggestedFix":"smallest fix"}],"coverage":[{"file":"path/to/file.ts","riskArea":"...","findings":["CI-1"],"validation":"not run","contextInspected":["imports/callers/tests/similar files"]}],"readinessScore":3}
-${REVIEW_JSON_END}
-Use valid JSON only inside the markers. If there are no findings, use an empty findings array.
-${modeInstructions.map((instruction, index) => `${14 + index}. ${instruction}`).join('\n')}
+Review checklist:
+1. Inspect every changed/assigned file; do not sample or stop after the first issue.
+2. For each file, classify risk area and check correctness, security, reliability/resource, performance, maintainability/convention, docs when applicable, tests, and AI-slop.
+3. Confirm findings with graph/context evidence: callers/callees, imports/imported-by, tests/counterparts, similar implementations, hard rules, and learnings.
+4. For high-risk paths, trace inputs to sinks and verify validation, authorization/ownership, sanitization, retries/cancellation, cleanup, and PII/secret logging.
+5. Check cross-file contracts: return shapes, thrown errors, nullable behavior, schema/API changes, component props, hook lifecycle, cache invalidation, and counterpart tests.
+6. ${LOCAL_PATTERN_REVIEW_GUIDANCE}
+7. ${AI_SLOP_REVIEW_GUIDANCE}
+8. ${SIMPLIFY_QUALITY_REVIEW_GUIDANCE}
+9. ${EFFICIENCY_REVIEW_GUIDANCE}
+10. ${REGRESSION_CHECK_REVIEW_GUIDANCE}
+11. ${ZERO_FINDING_CHALLENGE_REVIEW_GUIDANCE}
+12. Report only high-signal issues tied to real risk; omit cosmetic nits and broad rewrites. Include one coverage row per changed file and readiness score 0-5.
+13. Suggested fixes must cite an existing local pattern or say no pattern was found after checking.
+14. Treat Code Intelligence hard rules and high-confidence learnings as high-priority repo constraints.
 
-Important constraints:
-- Stay within the selected scope unless a tiny adjacent check is required to validate a finding.
-- Do not invent large refactors without evidence from touched code.
-- Do not suggest ad-hoc validation/parsing/auth/test helpers until you have checked existing local conventions and shared schemas/helpers.
-- Do not make cosmetic recommendations; every edit suggestion must reduce real risk, remove harmful duplication, materially improve clarity, or add meaningful test coverage.
-- Treat Code Intelligence hard rules and high-confidence learnings as high-priority repo constraints.`.trim()
+${REVIEW_OUTPUT_JSON_INSTRUCTIONS}`.trim()
 }
 
-function buildSubagentCodeIntelligenceReviewPrompt(scope: SelectedScope, extraFocus: string | undefined, intelligence: ImproveCodeIntelligenceResult): string {
+export function buildSubagentCodeIntelligenceReviewPrompt(scope: SelectedScope, extraFocus: string | undefined, intelligence: ReviewCodeIntelligenceResult, modelRouting?: ResolvedReviewModelRouting): string {
   const clusters = buildReviewClusters(intelligence)
   const waves = chunkArray(clusters, REVIEW_MAX_CONCURRENT_WORKERS)
   const taskSpecs = clusters.map((cluster, index) => ({
@@ -265,18 +280,21 @@ Code Intelligence summary:
 - Worker plan: ${clusters.length} worker task(s), ${waves.length} wave(s), max ${REVIEW_FILES_PER_WORKER} files/worker, max ${REVIEW_MAX_CONCURRENT_WORKERS} workers/wave
 - Freshness: index=${intelligence.contextPack?.freshness.indexState ?? 'unknown'}, embeddings=${intelligence.contextPack?.freshness.embeddingState ?? 'unknown'}
 
+${formatSubagentPreflightWarnings(intelligence.reviewWarnings)}
+
+${intelligence.indexedAnalysis ?? ''}
+
+${modelRouting ? formatReviewModelRoutingForPrompt(modelRouting) : 'Review model routing: omit task.model so subagents inherit the current session model.'}
+
 Instructions:
-1. Use the subagent_run tool in waves. Launch only the tasks from wave 1 first, wait for them to finish, then launch wave 2, and continue until all waves are reviewed. Never run more than the listed wave's tasks concurrently.
-2. For every subagent task, pass persist=false, contextMode='task_only', tools=${JSON.stringify(workerTools)}, and a compact task generated from the single Worker task template below plus that worker's assigned files/focus. Do not repeat this entire orchestration prompt or include broad raw code context.
-3. Subagents must not edit files. Each subagent must assess all of its assigned files, and for each assigned file consider all issue categories: correctness, security, reliability/resource, performance, maintainability/convention, docs when applicable, test coverage, and AI-slop. They should catch real bugs/security/reliability issues, and aggressively flag AI-slop when it creates concrete maintenance, test, or correctness risk.
-4. Subagents should return strict JSON only with this shape:
+1. Launch subagent_run in waves: run wave 1, wait, then wave 2, etc.; never exceed the listed wave concurrency.
+2. Each task: persist=true, contextMode='task_only', tools=${JSON.stringify(workerTools)}. Use the Worker task template plus assigned files/focus. Set task.model only from Review model routing; otherwise omit it.
+3. Subagents do not edit. They inspect every assigned file, verify/dismiss preflight warnings with evidence, and return strict JSON:
    {"findings":[{"id":"CI-<cluster>-1","severity":"P0|P1|P2|P3","title":"...","file":"...","line":"Lx-Ly","confidence":0.0,"type":"correctness|test|convention|maintainability|security|performance|resource|docs","riskArea":"...","evidence":"...","dataFlow":"... or n/a","contractsChecked":["..."],"testsToAdd":["..."],"revalidation":"...","suggestedFix":"..."}],"coverage":[{"file":"...","riskArea":"...","findings":["..."],"validation":"not run","contextInspected":["..."]}],"readinessScore":0}
-5. After subagents finish, aggregate their results: dedupe overlapping findings, severity-rank, and include one coverage row per changed file.
-6. Finish with a concise markdown report and a machine-readable JSON block between these exact markers:
-${REVIEW_JSON_START}
-{"findings":[],"coverage":[],"readinessScore":3}
-${REVIEW_JSON_END}
-Use valid JSON only inside the markers.
+4. Aggregate results: dedupe, severity-rank, include one coverage row per changed file, and directly review any unusable subagent result.
+5. Finish with a concise markdown report.
+
+${REVIEW_OUTPUT_JSON_INSTRUCTIONS}
 
 Worker task template:
 ${buildSubagentReviewTaskTemplate(extraFocus)}
@@ -287,18 +305,24 @@ ${JSON.stringify(taskSpecs, null, 2)}
 If subagent_run is unavailable or fails, fall back to a direct review using code_intelligence_search per changed file before reporting.`.trim()
 }
 
-function buildReviewClusters(intelligence: ImproveCodeIntelligenceResult): Array<{ files: string[]; focus: string[] }> {
+function buildReviewClusters(intelligence: ReviewCodeIntelligenceResult): Array<{ files: string[]; focus: string[] }> {
   const packets = intelligence.reviewPackets ?? []
-  if (packets.length === 0) return chunkStrings(intelligence.changedFiles, REVIEW_FILES_PER_WORKER).map((files) => ({ files, focus: ['changed-file review'] }))
-  const clusters: Array<{ files: string[]; focus: string[] }> = []
-  const packetChunks = chunkArray(packets, REVIEW_FILES_PER_WORKER)
-  for (const packetChunk of packetChunks) {
-    clusters.push({
-      files: packetChunk.map((packet) => packet.file),
-      focus: [...new Set(packetChunk.flatMap((packet) => packet.queryFocus ?? []))].slice(0, 12),
-    })
-  }
-  return clusters
+  const fileClusters = packets.length === 0
+    ? chunkStrings(intelligence.changedFiles, REVIEW_FILES_PER_WORKER).map((files) => ({ files, focus: ['changed-file review'] }))
+    : chunkArray(packets, REVIEW_FILES_PER_WORKER).map((packetChunk) => ({
+        files: packetChunk.map((packet) => packet.file),
+        focus: [...new Set(packetChunk.flatMap((packet) => packet.queryFocus ?? []))].slice(0, 12),
+      }))
+
+  return fileClusters.flatMap((cluster) => REVIEW_FOCUS_PASSES.map((pass) => ({
+    files: cluster.files,
+    focus: [...pass.focus, ...cluster.focus],
+  })))
+}
+
+function formatSubagentPreflightWarnings(reviewWarnings: string | undefined): string {
+  if (!reviewWarnings?.trim()) return 'Preflight warnings: none.'
+  return ['Preflight warnings to verify:', reviewWarnings.trim()].join('\n')
 }
 
 function chunkStrings(values: string[], size: number): string[][] {
@@ -319,15 +343,18 @@ export function buildSubagentReviewTaskTemplate(extraFocus?: string): string {
     'Assigned files: <files from task spec>.',
     'Review focus: <focus from task spec, if any>.',
     extraFocus ? `Additional user focus: ${extraFocus}` : '',
-    'Inspect every assigned file. Do not sample files, skip low-risk files, or stop after the first plausible issue. For each file, classify risk area and assess all issue categories: correctness, security, reliability/resource, performance, maintainability/convention, docs when applicable, test coverage, and AI-slop.',
-    'For each assigned file and category, form concrete hypotheses about bugs, inconsistencies, missing tests, or risky AI-slop patterns before reporting anything. If a category has no credible hypothesis after inspection, note that in coverage rather than omitting the file.',
-    'Retrieve context lazily to confirm or discard each hypothesis: first call code_intelligence_impact for the assigned files, then call code_intelligence_search with changedFiles/currentFiles set to the assigned files and targeted queries for graph edges, callers/callees, tests/counterparts, similar implementations, hard rules, and learnings. Read exact files/diffs only after that.',
-    'For risky files, follow call/data chains far enough to verify validation, authz/ownership/tenant checks, sanitization, timeouts/retries/cancellation, cleanup, and PII/secret logging behavior.',
-    'Before proposing any validation, parsing, auth, data-access, API, or test fix, inspect existing local patterns and name them in the finding: shared schemas, validators, safeParse/parse helpers, middleware, error helpers, test factories, route/service conventions, and similar implementations. Prefer the repo\'s existing abstraction even when an inline regex or ad-hoc helper would be the smallest functional patch. If the changed code bypasses an established pattern, report that convention violation with concrete evidence.',
+    'Inspect every assigned file; do not sample, skip low-risk files, or stop after the first plausible issue. For each file, classify risk area and assess correctness, security, reliability/resource, performance, maintainability/convention, docs when applicable, tests, and AI-slop.',
+    'Use code_intelligence_impact first, then targeted code_intelligence_search for callers/callees, tests/counterparts, similar implementations, hard rules, and learnings. Read exact files/diffs only after that.',
+    'For risky files, trace call/data paths far enough to verify validation, authz/ownership/tenant checks, sanitization, retries/cancellation, cleanup, and PII/secret logging behavior.',
+    LOCAL_PATTERN_REVIEW_GUIDANCE,
     'Check cross-file contracts through callers/callees/imports/tests: return shapes, thrown errors, nullable behavior, schema/API changes, component props, hook lifecycle, cache invalidation, and counterpart tests.',
-    'Aggressively hunt AI-slop issues with real impact: copy/pasted logic that will drift; duplicate types/schemas/validation rules; ad-hoc validation/parsing when shared schemas or local conventions exist; useless null checks or try/catch blocks that hide errors; broad catch-all handling that returns fake success; dead branches and impossible states; over-abstracted helpers that obscure simple logic; vague names like data/result/handler where domain names are needed; inconsistent patterns versus similar files; large mixed-concern files; hallucinated dependencies/APIs/options; comments that restate code; TODOs used instead of implementation; tests that only assert mocks or snapshots without behavior; and generated-looking code that bypasses repo conventions.',
-    'Before reporting, explicitly confirm or discard each hypothesis by trying to disprove it against guards, tests, configs, related files, learned context, documented contracts, and local implementation conventions. Omit speculative nits, but do not omit coverage for files/categories you assessed.',
-    'For each P1/P2 bug/security/reliability finding, include a concrete negative/regression test that would fail before the fix. Suggested fixes must cite the existing local pattern or explain that no pattern was found after checking related code.',
+    AI_SLOP_REVIEW_GUIDANCE,
+    SIMPLIFY_QUALITY_REVIEW_GUIDANCE,
+    EFFICIENCY_REVIEW_GUIDANCE,
+    REGRESSION_CHECK_REVIEW_GUIDANCE,
+    ZERO_FINDING_CHALLENGE_REVIEW_GUIDANCE,
+    'Confirm findings by trying to disprove them against guards, tests, configs, related files, learned context, documented contracts, and local conventions. Omit speculative nits, but include coverage for assessed files/categories.',
+    'For each P1/P2 bug/security/reliability finding, include a concrete negative/regression test. Suggested fixes must cite the existing local pattern or explain that no pattern was found after checking related code.',
     'Return strict JSON only: {"findings":[{"id":"<id>-1","severity":"P0|P1|P2|P3","title":"...","file":"...","line":"Lx-Ly","confidence":0.0,"type":"correctness|test|convention|maintainability|security|performance|resource|docs","riskArea":"...","evidence":"...","dataFlow":"... or n/a","contractsChecked":["..."],"testsToAdd":["..."],"revalidation":"...","suggestedFix":"..."}],"coverage":[{"file":"...","riskArea":"...","findings":["..."],"validation":"not run","contextInspected":["..."]}],"readinessScore":0}',
   ].filter(Boolean).join('\n')
 }
@@ -455,7 +482,8 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
   let runtime: CodeIntelligenceRuntime | undefined
   let currentIdentity: RepoIdentity | undefined
   let postEditReviewTimer: NodeJS.Timeout | undefined
-  let lastRetrievedContext: { source: string; at: string; contextPack: ContextPack } | undefined
+  let lastPostEditWarningKey: string | undefined
+  let lastPostEditWarningAt = 0
   let latestReviewOutput: ParsedReviewOutput | undefined
 
   pi.on('message_end', async (event, ctx) => {
@@ -506,7 +534,7 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
     }
   })
 
-  pi.on('input', async (event, ctx) => {
+  pi.on('input', async (event) => {
     if (!runtime || event.source === 'extension') return { action: 'continue' }
     const activeRuntime = runtime
     const text = event.text
@@ -531,8 +559,16 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
     if (event.toolName !== 'edit' && event.toolName !== 'write') return undefined
     if (postEditReviewTimer) clearTimeout(postEditReviewTimer)
     postEditReviewTimer = setTimeout(() => {
-      void runPostEditReview(pi, runtime, logger)
-    }, 300)
+      void runPostEditReview(pi, runtime, logger, {
+        shouldEmit: (key) => {
+          const now = Date.now()
+          if (key === lastPostEditWarningKey && now - lastPostEditWarningAt < 30_000) return false
+          lastPostEditWarningKey = key
+          lastPostEditWarningAt = now
+          return true
+        },
+      })
+    }, 1_000)
     return undefined
   })
 
@@ -540,7 +576,6 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
     if (!runtime) return undefined
     const contextPack = await retrievePlanningContextPack(runtime, event.prompt)
     const hasContext = Boolean(contextPack && (contextPack.codeContext.length > 0 || contextPack.learnings.length > 0 || contextPack.hardRules.length > 0))
-    if (contextPack && hasContext) lastRetrievedContext = { source: 'planning', at: new Date().toISOString(), contextPack }
     return {
       message: {
         customType: 'code-intelligence-context',
@@ -620,9 +655,9 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
     const scope = await resolveSelectedScope(pi, ctx)
     mark('resolve scope')
     if (ctx.hasUI) ctx.ui.setStatus('code-intelligence-review', 'review: loading code intelligence')
-    let intelligence: ImproveCodeIntelligenceResult
+    let intelligence: ReviewCodeIntelligenceResult
     try {
-      intelligence = await retrieveImproveCodeIntelligence({
+      intelligence = await retrieveReviewCodeIntelligence({
         pi,
         ctx,
         scope,
@@ -646,9 +681,10 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
     }
 
     const subagentsAvailable = pi.getActiveTools().includes('subagent_run')
+    const modelRouting = intelligence.reviewConfig ? resolveReviewModelRouting(intelligence.reviewConfig.modelRouting, ctx.model) : undefined
     const prompt = subagentsAvailable
-      ? buildSubagentCodeIntelligenceReviewPrompt(scope, stripImproveFlags(args) || undefined, intelligence)
-      : buildCodeIntelligenceReviewPrompt(scope, stripImproveFlags(args) || undefined, intelligence)
+      ? buildSubagentCodeIntelligenceReviewPrompt(scope, normalizeReviewFocus(args) || undefined, intelligence, modelRouting)
+      : buildCodeIntelligenceReviewPrompt(scope, normalizeReviewFocus(args) || undefined, intelligence)
     mark('build prompt')
     logger.info('code intelligence review command prepared', {
       timings,
@@ -761,7 +797,7 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
         return
       }
       const scope = await resolveSelectedScope(pi, ctx)
-      const changedFiles = await resolveImproveChangedFiles(pi, ctx, scope)
+      const changedFiles = await resolveReviewChangedFiles(pi, scope)
       const paths = changedFiles.length > 0 ? changedFiles : selectWholeRepoReviewFiles(resolvedRuntime.runtime.db, resolvedRuntime.runtime.identity.repoKey, '')
       const impact = retrieveImpactContextForDiff(resolvedRuntime.runtime.db, resolvedRuntime.runtime.identity.repoKey, paths, { maxFiles: Math.max(16, paths.length), maxItemsPerSection: 8, maxRelatedFiles: Math.max(100, paths.length * 2) })
       const report = formatMissingTestsReport(paths, impact, resolvedRuntime.runtime.config.testPaths)
@@ -931,6 +967,50 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
     },
   })
 
+  pi.registerTool<typeof codeIntelligenceAnalyzeChangesSchema>({
+    name: 'code_intelligence_analyze_changes',
+    label: 'Code Intelligence Analyze Changes',
+    description: 'Analyze changed or planned files using the code index for contract/API risk, review coverage, local patterns, test quality, and implementation planning context.',
+    promptSnippet: 'Analyze changed files with code intelligence for contract risks, impacted callers/tests, local patterns, missing counterparts, and review planning guidance.',
+    promptGuidelines: [
+      'Use code_intelligence_analyze_changes when reviewing or planning non-trivial changes that need indexed impact, test, convention, or API/schema drift context.',
+      'Use code_intelligence_analyze_changes before claiming no review findings on changes with exported APIs, route/schema/type changes, missing tests, or possible local-pattern reuse.',
+      'Use code_intelligence_analyze_changes output as guidance; verify exact code with read/search before editing or reporting findings.',
+    ],
+    parameters: codeIntelligenceAnalyzeChangesSchema,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const input = params as { paths?: string[]; repoPath?: string }
+      const targetCwd = input.repoPath ? resolve(ctx.cwd, input.repoPath) : ctx.cwd
+      const resolvedRuntime = await ensureRuntimeForCwd(targetCwd, ctx)
+      if (!resolvedRuntime.runtime) {
+        return {
+          content: [{ type: 'text', text: resolvedRuntime.warning ?? 'Code intelligence is not active for this session. Use /enable-code-intelligence first.' }],
+          details: { active: false, error: 'inactive_or_wrong_repo' },
+        }
+      }
+      const activeRuntime = resolvedRuntime.runtime
+      const paths = uniqueStrings(input.paths && input.paths.length > 0 ? input.paths : await getCurrentGitChangedFiles(pi, targetCwd))
+      const impact = retrieveImpactContextForDiff(activeRuntime.db, activeRuntime.identity.repoKey, paths, { maxFiles: Math.max(16, paths.length * 3), maxItemsPerSection: 8, maxRelatedFiles: Math.max(40, paths.length * 4) })
+      const packets = paths.map((file) => {
+        const graphSummary = impact.summaries.find((summary) => summary.path === file)
+        const testCounterparts = graphSummary ? uniqueStrings([...graphSummary.tests, ...graphSummary.counterparts]) : []
+        return {
+          file,
+          changedRanges: [],
+          changedDeclarations: [],
+          graphSummary,
+          relatedFiles: graphSummary ? uniqueStrings([...graphSummary.imports, ...graphSummary.importedBy, ...graphSummary.sameFeature, ...graphSummary.similar]) : [],
+          testCounterparts,
+          testStatus: testCounterparts.length > 0 ? 'found' as const : graphSummary ? 'missing_candidate' as const : 'unknown' as const,
+          queryFocus: [],
+          relevantSnippets: [],
+        }
+      })
+      const analysis = formatIndexedChangeAnalysis({ changedFiles: paths, reviewPackets: packets, graphContext: impact.summaries })
+      return { content: [{ type: 'text', text: analysis || 'No indexed change analysis available.' }], details: { active: true, paths, impact, analysis } }
+    },
+  })
+
   pi.registerTool<typeof codeIntelligenceSearchSchema, CodeIntelligenceSearchDetails>({
     name: 'code_intelligence_search',
     label: 'Code Intelligence Search',
@@ -941,6 +1021,7 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       'Use code_intelligence_search early for non-trivial codebase discovery unless the relevant files and functions are already known.',
       'Use code_intelligence_search before broad exploratory grep/read passes for questions about existing patterns, architecture, related tests, or where behavior is implemented.',
+      'For behavioral questions, use code_intelligence_search to find the likely implementation file, then use code_intelligence_impact on that file to inspect callers, consumers, and related configuration before answering.',
       'Prefer code_intelligence_search over rg when the query is conceptual or semantic; use rg afterward for exact symbol/string confirmation.',
       'Use code_intelligence_search with currentFiles or changedFiles when working near specific files so retrieval can prioritize nearby code and source/test counterparts.',
       'Use code_intelligence_search results silently as context; do not dump raw retrieved chunks unless the user asks for evidence or file references.',
@@ -1039,7 +1120,6 @@ export default function codeIntelligenceExtension(pi: ExtensionAPI) {
         maxTotalContextChars,
       })
 
-      lastRetrievedContext = { source: 'tool', at: new Date().toISOString(), contextPack }
       const fullFormat = input.format === 'full'
       const includeRawCode = input.includeRawCode ?? fullFormat
       const stats = getRetrievalStats(contextPack)
@@ -1617,9 +1697,14 @@ function formatCompactSearchOutput(contextPack: ContextPack, options: { includeR
 
   lines.push('', '## Suggested Next Actions')
   const topFiles = summarizeChunksByFile(contextPack).slice(0, 3).map((item) => item.path)
-  if (topFiles.length > 0) lines.push(`- Read likely relevant file(s): ${topFiles.map((path) => `\`${path}\``).join(', ')}`)
-  const symbols = contextPack.codeContext.map((chunk) => chunk.symbolName).filter(isUsefulSuggestedSymbol).slice(0, 4)
-  if (symbols.length > 0) lines.push(`- Use rg for exact confirmation of symbol(s): ${[...new Set(symbols)].map((symbol) => `\`${symbol}\``).join(', ')}`)
+  if (topFiles.length > 0) {
+    lines.push(`- Read likely relevant file(s): ${topFiles.map((path) => `\`${path}\``).join(', ')}`)
+    lines.push(`- Run code_intelligence_impact on likely behavior root(s): ${topFiles.slice(0, 2).map((path) => `\`${path}\``).join(', ')} to inspect callers, consumers, and related config.`)
+  }
+  const symbols = [...new Set(contextPack.codeContext.map((chunk) => chunk.symbolName).filter(isUsefulSuggestedSymbol))].slice(0, 4)
+  if (symbols.length > 0) lines.push(`- Use rg for exact confirmation of symbol(s): ${symbols.map((symbol) => `\`${symbol}\``).join(', ')}`)
+  const exactTerms = selectSuggestedExactSearchTerms(contextPack)
+  if (exactTerms.length > 0) lines.push(`- Search exact related mechanism(s): ${exactTerms.map((term) => `\`${term}\``).join(', ')}.`)
   lines.push('- Use tests/typecheck or direct reads to verify before editing when freshness or ranking is uncertain.')
   if (!options.includeRawCode) lines.push('- Use `format: "full"` or `includeRawCode: true` if you need raw code context immediately.')
 
@@ -1628,6 +1713,25 @@ function formatCompactSearchOutput(contextPack: ContextPack, options: { includeR
   }
 
   return lines.join('\n')
+}
+
+function selectSuggestedExactSearchTerms(contextPack: ContextPack): string[] {
+  const text = contextPack.codeContext
+    .flatMap((chunk) => [chunk.content, chunk.symbolName ?? '', chunk.path])
+    .join('\n')
+  const candidates = [
+    'refetchInterval',
+    'staleTime',
+    'invalidateQueries',
+    'queryKey',
+    'queryKeys',
+    'useQuery',
+    'AppState',
+    'setInterval',
+    'poll',
+    'refresh',
+  ]
+  return candidates.filter((candidate) => text.includes(candidate)).slice(0, 6)
 }
 
 function appendGraphSummary(promptText: string, graph: GraphFileSummary[], graphEdges: GraphEdgeDetails[] = []): string {
@@ -1717,7 +1821,6 @@ function updateProgressStatus(ctx: any, runtime: CodeIntelligenceRuntime | undef
   const embeddingService = runtime.services.get<EmbeddingService>('embeddingService')
   const dbEmbeddingStatus = getEmbeddingStatus(runtime.db)
   const embeddingStatus = dbEmbeddingStatus?.status ?? embeddingService?.status ?? 'not_started'
-  const embeddingStats = getEmbeddingStats(runtime.db, runtime.identity.repoKey)
   const busy = Boolean(indexStatus.workerPid) || indexStatus.running || indexStatus.queuedJobs > 0 || !['ready', 'fts_only', 'failed'].includes(embeddingStatus)
   const value = busy ? 'intelligence: active' : undefined
   if (progressUiState.progressTimer?.lastStatus === value) return
@@ -1733,22 +1836,35 @@ async function getCurrentGitDiff(pi: ExtensionAPI, cwd: string): Promise<string>
 ${staged.stdout ?? ''}`
 }
 
+async function getCurrentGitChangedFiles(pi: ExtensionAPI, cwd: string): Promise<string[]> {
+  const result = await pi.exec('git', ['-C', cwd, 'diff', '--name-only', 'HEAD'], { timeout: 10_000 })
+  return uniqueStrings((result.stdout ?? '').split(/\r?\n/))
+}
+
 async function runPostEditReview(
   pi: ExtensionAPI,
   runtime: CodeIntelligenceRuntime | undefined,
-  logger: CodeIntelligenceLogger
+  logger: CodeIntelligenceLogger,
+  options?: { shouldEmit?: (key: string) => boolean }
 ): Promise<void> {
   if (!runtime) return
   try {
     const diff = await getCurrentGitDiff(pi, runtime.identity.gitRoot)
     if (!diff.trim()) return
-    const result = reviewDiff(runtime.db, { repoKey: runtime.identity.repoKey, diff })
+    const result = await reviewDiffWithCodebaseDryChecks(runtime.db, {
+      repoKey: runtime.identity.repoKey,
+      diff,
+      embeddingService: runtime.services.get<EmbeddingService>('embeddingService'),
+    })
     const highConfidenceWarnings = result.warnings.filter((warning) => warning.severity === 'error' || warning.severity === 'warning')
     if (highConfidenceWarnings.length === 0) return
+    const content = formatDiffReviewWarnings({ ...result, warnings: highConfidenceWarnings })
+    const warningKey = highConfidenceWarnings.map((warning) => `${warning.ruleId}:${warning.path ?? ''}:${warning.evidence ?? ''}`).sort().join('\n')
+    if (options?.shouldEmit && !options.shouldEmit(warningKey)) return
     pi.sendMessage(
       {
         customType: 'code-intelligence-diff-review',
-        content: formatDiffReviewWarnings({ ...result, warnings: highConfidenceWarnings }),
+        content,
         display: true,
         details: { warnings: highConfidenceWarnings },
       },

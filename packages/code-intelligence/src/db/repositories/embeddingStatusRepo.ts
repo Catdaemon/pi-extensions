@@ -9,6 +9,14 @@ export function updateEmbeddingStatus(
     status: EmbeddingStatusValue
     activeModel?: string
     activeDimensions?: number
+    activeDevice?: string
+    downloadStatus?: string
+    downloadFile?: string
+    downloadLoadedBytes?: number
+    downloadTotalBytes?: number
+    downloadProgress?: number
+    embeddingRatePerSecond?: number
+    embeddingEtaSeconds?: number
     cacheDir: string
     lastError?: string
   }
@@ -19,6 +27,14 @@ export function updateEmbeddingStatus(
     provider: 'transformers',
     activeModel: input.activeModel ?? null,
     activeDimensions: input.activeDimensions ?? null,
+    activeDevice: input.activeDevice ?? null,
+    downloadStatus: input.downloadStatus ?? null,
+    downloadFile: input.downloadFile ?? null,
+    downloadLoadedBytes: input.downloadLoadedBytes ?? null,
+    downloadTotalBytes: input.downloadTotalBytes ?? null,
+    downloadProgress: input.downloadProgress === undefined ? null : Math.round(input.downloadProgress),
+    embeddingRatePerSecond: input.embeddingRatePerSecond === undefined ? null : Math.round(input.embeddingRatePerSecond * 100) / 100,
+    embeddingEtaSeconds: input.embeddingEtaSeconds === undefined ? null : Math.round(input.embeddingEtaSeconds),
     status: input.status,
     cacheDir: input.cacheDir,
     lastError: input.lastError ?? null,
@@ -35,6 +51,14 @@ export function updateEmbeddingStatus(
         provider: values.provider,
         activeModel: values.activeModel,
         activeDimensions: values.activeDimensions,
+        activeDevice: values.activeDevice,
+        downloadStatus: values.downloadStatus,
+        downloadFile: values.downloadFile,
+        downloadLoadedBytes: values.downloadLoadedBytes,
+        downloadTotalBytes: values.downloadTotalBytes,
+        downloadProgress: values.downloadProgress,
+        embeddingRatePerSecond: values.embeddingRatePerSecond,
+        embeddingEtaSeconds: values.embeddingEtaSeconds,
         status: values.status,
         cacheDir: values.cacheDir,
         lastError: values.lastError,
@@ -53,6 +77,14 @@ export function getEmbeddingStatus(db: CodeIntelligenceDb) {
         provider: row.provider,
         active_model: row.activeModel,
         active_dimensions: row.activeDimensions,
+        active_device: row.activeDevice,
+        download_status: row.downloadStatus,
+        download_file: row.downloadFile,
+        download_loaded_bytes: row.downloadLoadedBytes,
+        download_total_bytes: row.downloadTotalBytes,
+        download_progress: row.downloadProgress,
+        embedding_rate_per_second: row.embeddingRatePerSecond,
+        embedding_eta_seconds: row.embeddingEtaSeconds,
         status: row.status as EmbeddingStatusValue,
         cache_dir: row.cacheDir,
         last_error: row.lastError,

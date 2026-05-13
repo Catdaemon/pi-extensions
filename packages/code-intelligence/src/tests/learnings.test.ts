@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { openCodeIntelligenceDb } from '../db/connection.ts'
-import { createLearning, listLearnings, retrieveLearningFts } from '../db/repositories/learningsRepo.ts'
+import { createLearning, isDatabaseLockedError, listLearnings, retrieveLearningFts } from '../db/repositories/learningsRepo.ts'
 import { getLearningEmbeddingStats } from '../db/repositories/learningEmbeddingsRepo.ts'
 import { embedLearningIfReady } from '../embeddings/learningEmbeddingIndexer.ts'
 import { MockEmbeddingService } from '../embeddings/mockEmbeddingService.ts'
@@ -13,6 +13,12 @@ import { buildContextPack } from '../retrieval/contextPack.ts'
 import { retrieveLearningsHybrid } from '../retrieval/retrieveLearnings.ts'
 
 describe('manual codebase learnings', () => {
+  it('recognizes transient SQLite lock errors', () => {
+    assert.equal(isDatabaseLockedError(Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' })), true)
+    assert.equal(isDatabaseLockedError(new Error('database is busy')), true)
+    assert.equal(isDatabaseLockedError(new Error('schema mismatch')), false)
+  })
+
   it('extracts obvious manual learning patterns', () => {
     const avoid = extractManualLearning('Do not use moment.js, use date-fns')
     assert.equal(avoid?.ruleType, 'avoid_pattern')

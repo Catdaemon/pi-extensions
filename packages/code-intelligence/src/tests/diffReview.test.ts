@@ -4,10 +4,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { openCodeIntelligenceDb } from '../db/connection.ts'
+import { createHash } from 'node:crypto'
+import { replaceChunksForFile } from '../db/repositories/chunksRepo.ts'
+import { upsertIndexedFile } from '../db/repositories/filesRepo.ts'
 import { createLearning } from '../db/repositories/learningsRepo.ts'
 import { extractManualLearning } from '../learnings/extractLearning.ts'
 import { parseUnifiedDiff } from '../review/diffParser.ts'
-import { reviewDiff } from '../review/reviewDiff.ts'
+import { applyMachineRules } from '../review/machineChecks.ts'
+import { reviewDiff, reviewDiffWithCodebaseDryChecks } from '../review/reviewDiff.ts'
 
 describe('diff review', () => {
   it('parses changed files, added imports, and dependency additions', () => {
@@ -83,6 +87,95 @@ diff --git a/src/generated/client.ts b/src/generated/client.ts
     }
   })
 
+  it('warns on repeated long added text as a likely DRY issue', () => {
+    const duplicatedInstruction = 'This is a long duplicated review instruction that should probably be shared as a named constant.'
+    const parsed = parseUnifiedDiff(`diff --git a/src/a.ts b/src/a.ts
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -0,0 +1,2 @@
++const message = '${duplicatedInstruction}'
++const other = 1
+diff --git a/src/b.ts b/src/b.ts
+--- a/src/b.ts
++++ b/src/b.ts
+@@ -0,0 +1 @@
++const message = '${duplicatedInstruction}'
+`)
+
+    const warnings = applyMachineRules(parsed, [])
+
+    assert(warnings.some((warning) => warning.ruleKind === 'duplicate_added_text' && /src\/a\.ts/.test(warning.evidence ?? '') && /src\/b\.ts/.test(warning.evidence ?? '')))
+  })
+
+  it('warns when added code resembles existing indexed code', async () => {
+    const { db, storage } = await setupDb()
+    try {
+      const existing = `function normalizeProviderName(provider: string): string {\n  return provider.trim().toLowerCase().replace(/^openai-codex$/, 'openai')\n}`
+      const file = upsertIndexedFile(db, {
+        repoKey: 'review-repo',
+        path: 'src/modelRouting.ts',
+        language: 'typescript',
+        fileHash: hash(existing),
+        sizeBytes: existing.length,
+        isGenerated: false,
+      })
+      replaceChunksForFile(db, file.id, [{
+        repoKey: 'review-repo',
+        fileId: file.id,
+        path: 'src/modelRouting.ts',
+        language: 'typescript',
+        chunkKind: 'function',
+        symbolName: 'normalizeProviderName',
+        symbolKind: 'function',
+        startLine: 1,
+        endLine: 3,
+        content: existing,
+        contentHash: hash(existing),
+      }])
+
+      const result = await reviewDiffWithCodebaseDryChecks(db, {
+        repoKey: 'review-repo',
+        diff: `diff --git a/src/newRouting.ts b/src/newRouting.ts
+--- a/src/newRouting.ts
++++ b/src/newRouting.ts
+@@ -0,0 +1,3 @@
++function normalizeProviderName(provider: string): string {
++  return provider.trim().toLowerCase().replace(/^openai-codex$/, 'openai')
++}
+`,
+      })
+
+      assert(result.warnings.some((warning) => warning.ruleId === 'intrinsic:codebase_dry_similarity' && warning.evidence?.includes('src/modelRouting.ts')))
+    } finally {
+      db.close()
+      await rm(storage, { recursive: true, force: true })
+    }
+  })
+
+  it('ignores invalid required_test_path rules that point at source files', () => {
+    const parsed = parseUnifiedDiff(`diff --git a/src/unrelated.ts b/src/unrelated.ts
+--- a/src/unrelated.ts
++++ b/src/unrelated.ts
+@@ -1 +1,2 @@
+ export const value = 1
++export const other = 2
+`)
+
+    const warnings = applyMachineRules(parsed, [{
+      id: 'rule-auth-store',
+      learningId: 'learning-auth-store',
+      repoKey: 'review-repo',
+      ruleKind: 'required_test_path',
+      pattern: 'src/store/authStore.ts',
+      message: 'For zustand persist stores with a hydrated gate, ensure onRehydrateStorage marks hydration complete even when storage rehydration errors or state is unavailable.',
+      pathGlobs: ['src/store/authStore.ts'],
+      severity: 'warning',
+      status: 'active',
+    }])
+
+    assert.equal(warnings.length, 0)
+  })
+
   it('warns when required test paths are missing', async () => {
     const { db, storage } = await setupDb()
     try {
@@ -124,6 +217,10 @@ diff --git a/test/api/invoices.test.ts b/test/api/invoices.test.ts
     }
   })
 })
+
+function hash(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
 
 async function setupDb() {
   const storage = await mkdtemp(join(tmpdir(), 'pi-code-intelligence-review-db-'))

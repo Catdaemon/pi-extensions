@@ -15,7 +15,7 @@ export type PlanningContextRequest = RetrieveCodeRequest & {
   maxTotalContextChars?: number
 }
 
-const PLANNING_TRIGGER = /\b(implement|add|create|change|modify|update|refactor|fix|debug|test|failing|error|route|component|api|endpoint|feature|bug|edit|rewrite|migrate|rename|remove)\b/i
+const PLANNING_TRIGGER = /\b(implement|add|create|change|modify|update|refactor|fix|debug|test|failing|error|route|component|api|endpoint|feature|bug|edit|rewrite|migrate|rename|remove|find|trace|where|when|why|how often|what controls|refresh|poll|refetch|invalidate|query)\b/i
 const TRIVIAL_PROMPT = /^(thanks|thank you|ok|okay|yes|no|nice|looks good|continue|go on|proceed)\.?$/i
 const PATH_PATTERN = /(?:^|[\s`'"(])((?:[\w.-]+\/)+[\w.@-]+\.[A-Za-z0-9]+|[\w.@-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|mdx|yaml|yml|toml|css|scss|html|py|go|rs|java|sh))(?:$|[\s`'"),:])/g
 

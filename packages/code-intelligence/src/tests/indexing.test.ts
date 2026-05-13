@@ -7,14 +7,16 @@ import { DEFAULT_CONFIG, loadConfig, type CodeIntelligenceConfig } from '../conf
 import { openCodeIntelligenceDb } from '../db/connection.ts'
 import { getChunkStats } from '../db/repositories/chunksRepo.ts'
 import { getEmbeddingStats } from '../db/repositories/embeddingsRepo.ts'
-import { getFileIndexStats, getIndexedFileByPath, pruneDeletedFileRows } from '../db/repositories/filesRepo.ts'
+import { getFileIndexStats, getIndexedFileByPath, pruneDeletedFileRows, upsertIndexedFile } from '../db/repositories/filesRepo.ts'
 import { getIndexingState } from '../db/repositories/indexingStateRepo.ts'
+import { replaceCodeRelationshipsForFile } from '../db/repositories/relationshipsRepo.ts'
+import { replaceFileRelationshipsForFile } from '../db/repositories/fileRelationshipsRepo.ts'
 import { chunkFile } from '../indexing/chunker.ts'
 import { detectGeneratedFile } from '../indexing/generated.ts'
 import { buildWorkerProcessArgs, parseWorkerProcessEntries, parseWorkerProcessList, runFullRepoIndex, runIncrementalIndex } from '../indexing/indexScheduler.ts'
 import { scanRepoFiles } from '../indexing/fileScanner.ts'
 import type { CodeIntelligenceLogger } from '../logger.ts'
-import { buildBoundedChunkEmbeddingText, MAX_EMBEDDING_TEXT_CHARS } from '../embeddings/embeddingIndexer.ts'
+import { buildBoundedChunkEmbeddingText, buildChunkGraphContext, embeddingThroughput, MAX_EMBEDDING_TEXT_CHARS, resolveEmbeddingBatchSize } from '../embeddings/embeddingIndexer.ts'
 import { MockEmbeddingService } from '../embeddings/mockEmbeddingService.ts'
 import { buildContextPack } from '../retrieval/contextPack.ts'
 import { retrieveCodeFts, retrieveCodeHybrid } from '../retrieval/retrieveCode.ts'
@@ -34,7 +36,7 @@ function testConfig(overrides: Partial<CodeIntelligenceConfig> = {}): CodeIntell
     exclude: [...DEFAULT_CONFIG.exclude],
     ...overrides,
     embedding: { ...DEFAULT_CONFIG.embedding, ...(overrides.embedding ?? {}) },
-    review: overrides.review ?? { rules: [], status: { filesLoaded: [], errors: [] } },
+    review: overrides.review ?? { rules: [], status: { filesLoaded: [], errors: [] }, modelRouting: DEFAULT_CONFIG.review.modelRouting },
   }
 }
 
@@ -274,6 +276,55 @@ describe('incremental indexing', () => {
 })
 
 describe('embedding input bounds', () => {
+  it('resolves backend-specific embedding batch sizes', () => {
+    const embedding = DEFAULT_CONFIG.embedding
+    assert.equal(resolveEmbeddingBatchSize(embedding, 'cpu'), 8)
+    assert.equal(resolveEmbeddingBatchSize(embedding, 'coreml'), 32)
+    assert.equal(resolveEmbeddingBatchSize(embedding, 'cuda'), 64)
+    assert.equal(resolveEmbeddingBatchSize(embedding, 'unknown'), 8)
+  })
+
+  it('computes embedding throughput and ETA', () => {
+    assert.deepEqual(embeddingThroughput(50, 100, 1_000, 11_000), { embeddingRatePerSecond: 5, embeddingEtaSeconds: 10 })
+    assert.deepEqual(embeddingThroughput(0, 100, 1_000, 11_000), {})
+  })
+
+  it('adds bounded graph context to chunk embedding text', async () => {
+    const storage = await mkdtemp(join(tmpdir(), 'pi-code-intelligence-embedding-context-'))
+    const db = await openCodeIntelligenceDb(storage)
+    try {
+      const file = upsertIndexedFile(db, { repoKey: 'repo', path: 'src/app.ts', language: 'typescript', fileHash: 'a', sizeBytes: 10, isGenerated: false })
+      replaceFileRelationshipsForFile(db, 'repo', 'src/app.ts', [
+        { repoKey: 'repo', sourcePath: 'src/app.ts', targetPath: 'src/app.test.ts', kind: 'test_counterpart', confidence: 0.8 },
+      ])
+      replaceCodeRelationshipsForFile(db, 'repo', 'src/app.ts', [
+        { repoKey: 'repo', sourcePath: 'src/app.ts', targetPath: 'src/lib.ts', sourceName: 'App', targetName: 'useThing', kind: 'uses_hook', confidence: 0.8 },
+        { repoKey: 'repo', sourcePath: 'src/app.ts', targetPath: 'src/other.ts', sourceName: 'Other', targetName: 'ignored', kind: 'calls', confidence: 0.8 },
+      ])
+
+      const chunk = {
+        repoKey: 'repo',
+        fileId: file.id,
+        path: 'src/app.ts',
+        chunkKind: 'symbol',
+        symbolName: 'App',
+        startLine: 1,
+        endLine: 10,
+        content: 'export function App() {}',
+        contentHash: 'hash',
+      }
+      const graphContext = buildChunkGraphContext(db, chunk)
+      const text = buildBoundedChunkEmbeddingText(chunk, graphContext)
+      assert(text.includes('Graph context:'))
+      assert(text.includes('File test_counterpart: src/app.test.ts'))
+      assert(text.includes('Code uses_hook: App -> useThing in src/lib.ts'))
+      assert(!text.includes('ignored'))
+    } finally {
+      db.close()
+      await rm(storage, { recursive: true, force: true })
+    }
+  })
+
   it('truncates oversized chunk embedding text before sending it to the model', () => {
     const text = buildBoundedChunkEmbeddingText({
       repoKey: 'repo',

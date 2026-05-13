@@ -3,31 +3,14 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
-import { buildImproveQueries, buildImproveReviewConfigContext, buildReviewPackets, buildReviewReportTemplate, buildStructuredReviewRequirements, formatImproveReviewConfigContext, formatReviewPackets, parseChangedRangesFromDiff, parseImproveMode, renderImproveCodeIntelligenceContext, resolveImproveChangedFiles, selectWholeRepoReviewFiles, stripImproveFlags } from '../pi/improveIntegration.ts'
+import { buildReviewQueries, buildReviewConfigContext, buildReviewPackets, buildReviewReportTemplate, buildStructuredReviewRequirements, formatIndexedChangeAnalysis, formatReviewConfigContext, formatReviewModelRoutingForPrompt, formatReviewPackets, normalizeReviewFocus, parseChangedRangesFromDiff, renderReviewCodeIntelligenceContext, resolveReviewChangedFiles, resolveReviewModelRouting, selectWholeRepoReviewFiles } from '../pi/reviewContext.ts'
 import { DEFAULT_CONFIG } from '../config.ts'
 import { openCodeIntelligenceDb } from '../db/connection.ts'
 import { upsertIndexedFile } from '../db/repositories/filesRepo.ts'
 
-describe('/improve code intelligence integration', () => {
-  it('parses supported mode flags', () => {
-    assert.equal(parseImproveMode('--changed focus on API routes'), 'changed')
-    assert.equal(parseImproveMode('focus on API routes --review'), 'review')
-    assert.equal(parseImproveMode('--tests add coverage'), 'tests')
-    assert.equal(parseImproveMode('--conventions'), 'conventions')
-    assert.equal(parseImproveMode('--package src/foo.ts'), 'package')
-    assert.equal(parseImproveMode('focus on API routes'), 'default')
-  })
-
-  it('does not treat longer option names as /improve mode flags', () => {
-    assert.equal(parseImproveMode('--changed-files src/foo.ts'), 'default')
-    assert.equal(parseImproveMode('--package-name api'), 'default')
-    assert.equal(stripImproveFlags('--changed-files src/foo.ts'), '--changed-files src/foo.ts')
-  })
-
-  it('strips only standalone mode flags and normalizes focus spacing', () => {
-    assert.equal(stripImproveFlags('--changed   focus on src/foo.ts'), 'focus on src/foo.ts')
-    assert.equal(stripImproveFlags('focus on src/foo.ts --review'), 'focus on src/foo.ts')
-    assert.equal(stripImproveFlags('focus --tests on coverage'), 'focus on coverage')
+describe('/code-intelligence-review context', () => {
+  it('normalizes free-form review focus without interpreting legacy mode flags', () => {
+    assert.equal(normalizeReviewFocus('  focus   auth paths  --tests '), 'focus auth paths --tests')
   })
 
   it('builds structured review report requirements', () => {
@@ -46,10 +29,11 @@ describe('/improve code intelligence integration', () => {
   })
 
   it('filters and formats repo-local review config for changed files', () => {
-    const context = buildImproveReviewConfigContext({
+    const context = buildReviewConfigContext({
       ...DEFAULT_CONFIG,
       review: {
         status: { filesLoaded: ['.pi-code-intelligence.json'], errors: [] },
+        modelRouting: DEFAULT_CONFIG.review.modelRouting,
         rules: [
           { id: 'api-tests', severity: 'warning', scope: ['src/api/**'], instruction: 'API changes need route-level regression tests.' },
           { id: 'docs', severity: 'info', scope: ['docs/**'], instruction: 'Docs changes need examples.' },
@@ -59,16 +43,34 @@ describe('/improve code intelligence integration', () => {
 
     assert.equal(context.matchingRules.length, 1)
     assert.equal(context.matchingRules[0]?.id, 'api-tests')
-    const formatted = formatImproveReviewConfigContext(context)
+    const formatted = formatReviewConfigContext(context)
     assert.match(formatted, /Repo-local Review Config/)
     assert.match(formatted, /api-tests/)
     assert.doesNotMatch(formatted, /Docs changes/)
   })
 
-  it('adds graph context to review mode context', () => {
-    const rendered = renderImproveCodeIntelligenceContext({
+  it('routes cheap review passes to same-family models only', () => {
+    const openaiRouting = resolveReviewModelRouting(DEFAULT_CONFIG.review.modelRouting, { provider: 'openai', id: 'gpt-4.1' })
+    assert.equal(openaiRouting.models.triage, 'openai/gpt-4.1-mini')
+    assert.equal(openaiRouting.models.aiSlop, 'openai/gpt-4.1-mini')
+    assert.equal(openaiRouting.models.security, undefined)
+
+    const customProviderRouting = resolveReviewModelRouting(DEFAULT_CONFIG.review.modelRouting, { provider: 'openai-codex', id: 'gpt-5.5' })
+    assert.equal(customProviderRouting.models.triage, 'openai-codex/gpt-5.4-mini')
+    assert.equal(customProviderRouting.models.aiSlop, 'openai-codex/gpt-5.4-mini')
+
+    const blocked = resolveReviewModelRouting({ strategy: 'explicit', allowCrossProvider: false, models: { triage: 'anthropic/claude-3-5-haiku-latest' } }, { provider: 'openai', id: 'gpt-4.1' })
+    assert.equal(blocked.models.triage, undefined)
+    assert(blocked.notes.some((note) => note.includes('Ignored triage model')))
+
+    const prompt = formatReviewModelRoutingForPrompt(openaiRouting)
+    assert.match(prompt, /triage: openai\/gpt-4.1-mini/)
+    assert.match(prompt, /For any pass not listed above, omit task.model/)
+  })
+
+  it('adds graph context to review context', () => {
+    const rendered = renderReviewCodeIntelligenceContext({
       enabled: true,
-      mode: 'review',
       changedFiles: ['src/app.ts'],
       contextPack: {
         codeContext: [],
@@ -99,12 +101,11 @@ describe('/improve code intelligence integration', () => {
     assert.match(rendered, /Imported by: src\/app.test.ts/)
   })
 
-  it('builds category and bounded per-file improve retrieval queries', () => {
-    const queries = buildImproveQueries({
+  it('builds category and bounded per-file review retrieval queries', () => {
+    const queries = buildReviewQueries({
       baseQuery: 'base review',
       focus: 'focus auth paths',
       changedFiles: Array.from({ length: 10 }, (_, index) => `src/file${index}.ts`),
-      mode: 'review',
     })
 
     assert(queries.some((query) => query.includes('Correctness review')))
@@ -140,7 +141,7 @@ describe('/improve code intelligence integration', () => {
       },
     }
 
-    const files = await resolveImproveChangedFiles(pi as any, { cwd: '/repo' } as any, {
+    const files = await resolveReviewChangedFiles(pi as any, {
       mode: 'git_changes',
       repoRoot: '/repo',
       summary: 'Use the staged and unstaged git changes in the current worktree.',
@@ -174,6 +175,47 @@ describe('/improve code intelligence integration', () => {
     assert.deepEqual(ranges.get('src/app.ts'), [{ startLine: 1, endLine: 1, addedLines: 1 }])
     assert.equal(ranges.has('src/deleted.ts'), false)
     assert.deepEqual(ranges.get('src/next.ts'), [{ startLine: 4, endLine: 5, addedLines: 2 }])
+  })
+
+  it('formats indexed change analysis for contracts, coverage, tests, patterns, and planning', () => {
+    const analysis = formatIndexedChangeAnalysis({
+      changedFiles: ['src/api.ts'],
+      reviewPackets: [{
+        file: 'src/api.ts',
+        changedRanges: [],
+        changedDeclarations: [{ name: 'getUser', kind: 'function', startLine: 10 }],
+        graphSummary: {
+          path: 'src/api.ts',
+          declarations: [{ name: 'getUser', kind: 'function', startLine: 10, exported: true }],
+          imports: [],
+          importedBy: ['src/routes.ts'],
+          tests: [],
+          counterparts: [],
+          routeScreens: [],
+          sameFeature: [],
+          calls: [],
+          calledBy: ['src/routes.ts#handler'],
+          renders: [],
+          hooks: [],
+          similar: ['src/otherApi.ts'],
+        },
+        relatedFiles: ['src/routes.ts'],
+        testCounterparts: [],
+        testStatus: 'missing_candidate',
+        queryFocus: [],
+        relevantSnippets: [],
+      }],
+      reviewWarnings: 'warning',
+    })
+
+    assert.match(analysis, /Contract\/API risk/)
+    assert.match(analysis, /Review coverage/)
+    assert.match(analysis, /Local patterns/)
+    assert.match(analysis, /Test quality/)
+    assert.match(analysis, /Implementation planning/)
+    assert.match(analysis, /High-impact changed files: src\/api\.ts/)
+    assert.match(analysis, /Missing\/unknown test counterparts: src\/api\.ts/)
+    assert.match(analysis, /src\/otherApi\.ts/)
   })
 
   it('builds per-file review packets from graph context and retrieved snippets', () => {
@@ -260,9 +302,8 @@ describe('/improve code intelligence integration', () => {
   })
 
   it('surfaces unavailable-code-intelligence warnings in the prompt context', () => {
-    const rendered = renderImproveCodeIntelligenceContext({
+    const rendered = renderReviewCodeIntelligenceContext({
       enabled: false,
-      mode: 'default',
       changedFiles: [],
       warning: 'Code intelligence context retrieval failed: database is locked',
     })

@@ -1,4 +1,5 @@
 import { matchesAnyGlob } from '../indexing/glob.ts'
+import { isTestPath, isTestRequirementPattern } from '../lib/pathClassifiers.ts'
 import type { MachineRule } from '../rules/types.ts'
 import type { ParsedDiff } from './diffParser.ts'
 
@@ -13,7 +14,7 @@ export type DiffReviewWarning = {
 }
 
 export function applyMachineRules(diff: ParsedDiff, rules: MachineRule[]): DiffReviewWarning[] {
-  const warnings: DiffReviewWarning[] = []
+  const warnings: DiffReviewWarning[] = [...checkDuplicateAddedText(diff)]
   for (const rule of rules.filter((item) => item.status === 'active')) {
     if (rule.ruleKind === 'forbidden_import') warnings.push(...checkForbiddenImport(diff, rule))
     else if (rule.ruleKind === 'forbidden_dependency') warnings.push(...checkForbiddenDependency(diff, rule))
@@ -21,6 +22,38 @@ export function applyMachineRules(diff: ParsedDiff, rules: MachineRule[]): DiffR
     else if (rule.ruleKind === 'required_test_path') warnings.push(...checkRequiredTestPath(diff, rule))
   }
   return dedupeWarnings(warnings)
+}
+
+function checkDuplicateAddedText(diff: ParsedDiff): DiffReviewWarning[] {
+  const seen = new Map<string, Array<{ path: string; line: string }>>()
+  for (const file of diff.files) {
+    for (const line of file.addedLines) {
+      const normalized = normalizeDuplicateCandidate(line)
+      if (!normalized) continue
+      const matches = seen.get(normalized) ?? []
+      matches.push({ path: file.path, line: line.trim() })
+      seen.set(normalized, matches)
+    }
+  }
+
+  return Array.from(seen.entries())
+    .filter(([, matches]) => matches.length > 1)
+    .map(([pattern, matches]) => ({
+      ruleId: 'intrinsic:duplicate_added_text',
+      ruleKind: 'duplicate_added_text',
+      severity: 'warning',
+      message: 'Repeated added text may be a DRY violation; consider extracting a shared constant/helper if it represents the same concept.',
+      pattern,
+      evidence: matches.map((match) => `${match.path}: ${match.line}`).slice(0, 4).join(' | '),
+    }))
+}
+
+function normalizeDuplicateCandidate(line: string): string | undefined {
+  const trimmed = line.trim().replace(/\s+/g, ' ')
+  if (trimmed.length < 80) return undefined
+  if (/^[{}()[\],;]+$/.test(trimmed)) return undefined
+  if (/^(import|export)\s/.test(trimmed)) return undefined
+  return trimmed
 }
 
 function checkForbiddenImport(diff: ParsedDiff, rule: MachineRule): DiffReviewWarning[] {
@@ -40,8 +73,10 @@ function checkForbiddenPathEdit(diff: ParsedDiff, rule: MachineRule): DiffReview
 }
 
 function checkRequiredTestPath(diff: ParsedDiff, rule: MachineRule): DiffReviewWarning[] {
+  if (!isTestRequirementPattern(rule.pattern)) return []
   const changedFiles = diff.files.map((file) => file.path)
-  const hasSourceChange = changedFiles.some((path) => !isTestPath(path) && !pathMatches(path, rule))
+  const sourceGlobs = rule.pathGlobs?.filter((pattern) => !isTestRequirementPattern(pattern)) ?? []
+  const hasSourceChange = changedFiles.some((path) => !isTestPath(path) && (sourceGlobs.length === 0 || matchesAnyGlob(path, sourceGlobs)))
   if (!hasSourceChange) return []
   const hasRequiredTest = changedFiles.some((path) => matchesAnyGlob(path, [rule.pattern]))
   return hasRequiredTest ? [] : [warning(rule, undefined, `no changed file matched ${rule.pattern}`)]
@@ -70,10 +105,6 @@ function stripJs(value: string): string {
 function pathMatches(path: string, rule: MachineRule): boolean {
   const patterns = rule.pathGlobs?.length ? rule.pathGlobs : [rule.pattern]
   return matchesAnyGlob(path, patterns)
-}
-
-function isTestPath(path: string): boolean {
-  return /(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[jt]sx?$/.test(path)
 }
 
 function dedupeWarnings(warnings: DiffReviewWarning[]): DiffReviewWarning[] {

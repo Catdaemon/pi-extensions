@@ -118,7 +118,7 @@ async function findSemanticDuplicate(
     maxLearnings: 3,
   })
   return similar.find((learning) => {
-    if (learning.score < 0.72) return false
+    if (learning.score < 0.78) return false
     if (learning.ruleType !== candidate.ruleType) return false
     if (!termsOverlap(learning, candidate)) return false
     if (candidate.pathGlobs?.length && learning.pathGlobs?.length && !candidate.pathGlobs.some((glob) => learning.pathGlobs?.includes(glob))) return false
@@ -129,13 +129,38 @@ async function findSemanticDuplicate(
 function termsOverlap(learning: CodebaseLearning, candidate: LearningCandidate): boolean {
   const learningTerms = [learning.title, learning.summary, learning.avoid, learning.prefer].filter(Boolean).join(' ').toLowerCase()
   const candidateTerms = [candidate.title, candidate.summary, candidate.avoid, candidate.prefer].filter(Boolean).join(' ').toLowerCase()
-  const keyTerms = [...(candidate.avoid?.split(/\W+/) ?? []), ...(candidate.prefer?.split(/\W+/) ?? [])]
-    .map((term) => term.toLowerCase())
-    .filter((term) => term.length >= 3)
-  if (keyTerms.some((term) => learningTerms.includes(term))) return true
-  if (learning.avoid && candidateTerms.includes(learning.avoid.toLowerCase())) return true
-  if (learning.prefer && candidateTerms.includes(learning.prefer.toLowerCase())) return true
-  return false
+  const learningAvoid = learning.avoid?.trim().toLowerCase()
+  const learningPrefer = learning.prefer?.trim().toLowerCase()
+  const candidateAvoid = candidate.avoid?.trim().toLowerCase()
+  const candidatePrefer = candidate.prefer?.trim().toLowerCase()
+
+  if (learningAvoid && candidateAvoid && phrasesCompatible(learningAvoid, candidateAvoid)) return true
+  if (learningPrefer && candidatePrefer && phrasesCompatible(learningPrefer, candidatePrefer)) return true
+  if (learningAvoid && candidateTerms.includes(learningAvoid) && learningAvoid.length >= 12) return true
+  if (learningPrefer && candidateTerms.includes(learningPrefer) && learningPrefer.length >= 12) return true
+
+  const candidateKeyTerms = significantTerms([candidate.avoid, candidate.prefer].filter(Boolean).join(' '))
+  if (candidateKeyTerms.length === 0) return false
+  const learningKeyTerms = new Set(significantTerms(learningTerms))
+  const shared = candidateKeyTerms.filter((term) => learningKeyTerms.has(term))
+  const requiredSharedTerms = candidateKeyTerms.length <= 3 ? candidateKeyTerms.length : Math.max(2, Math.ceil(candidateKeyTerms.length * 0.5))
+  return shared.length >= requiredSharedTerms
+}
+
+function phrasesCompatible(left: string, right: string): boolean {
+  if (left === right) return true
+  if (left.length >= 12 && right.includes(left)) return true
+  if (right.length >= 12 && left.includes(right)) return true
+  const leftTerms = significantTerms(left)
+  const rightTerms = new Set(significantTerms(right))
+  if (leftTerms.length === 0 || rightTerms.size === 0) return false
+  const shared = leftTerms.filter((term) => rightTerms.has(term)).length
+  return shared >= Math.max(2, Math.ceil(Math.min(leftTerms.length, rightTerms.size) * 0.6))
+}
+
+function significantTerms(text: string): string[] {
+  const stopwords = new Set(['the', 'and', 'for', 'with', 'when', 'this', 'that', 'use', 'using', 'always', 'never', 'prefer', 'avoid', 'should', 'work', 'repo'])
+  return [...new Set(text.toLowerCase().split(/\W+/).filter((term) => term.length >= 4 && !stopwords.has(term)))]
 }
 
 function isGenericFallbackExtraction(extracted: { title: string; summary: string; avoid?: string; prefer?: string; pathGlobs?: string[] }, text: string): boolean {

@@ -9,7 +9,7 @@ import { listLearningEvents } from '../db/repositories/eventsRepo.ts'
 import { listLearnings } from '../db/repositories/learningsRepo.ts'
 import { MockEmbeddingService } from '../embeddings/mockEmbeddingService.ts'
 import { maybeCorrectionSignal, correctionConfidence, activationStatusForConfidence } from '../learnings/detectCorrection.ts'
-import { captureCorrectionLearning } from '../pi/correctionCapture.ts'
+import { captureCorrectionLearning, createOrReuseLearning } from '../pi/correctionCapture.ts'
 import type { CodeIntelligenceRuntime } from '../lifecycle/activate.ts'
 import { ServiceRegistry } from '../lifecycle/serviceRegistry.ts'
 import type { RepoIdentity } from '../repo/identifyRepo.ts'
@@ -180,6 +180,44 @@ describe('automatic correction capture', () => {
       assert.equal(learnings.length, 2)
       assert(learnings.some((learning) => learning.title.includes('as keyword')))
       assert(learnings.some((learning) => learning.summary.toLowerCase().includes('sqlite learning db')))
+    } finally {
+      db.close()
+      await rm(storage, { recursive: true, force: true })
+    }
+  })
+
+  it('does not reuse a learning just because one domain term overlaps', async () => {
+    const storage = await mkdtemp(join(tmpdir(), 'pi-code-intelligence-correction-db-'))
+    const db = await openCodeIntelligenceDb(storage)
+    const runtime = makeRuntime(db, storage)
+
+    try {
+      const first = await createOrReuseLearning(runtime, {
+        title: 'Run DB migrations with bunx supabase migration up',
+        summary: 'Run DB migrations with bunx supabase migration up.',
+        ruleType: 'workflow',
+        appliesWhen: 'When applying database migrations.',
+        prefer: 'bunx supabase migration up',
+        confidence: 0.9,
+        priority: 70,
+        status: 'active',
+      })
+      const second = await createOrReuseLearning(runtime, {
+        title: 'Generate migrations and do not hand-edit SQL files',
+        summary: 'Only one migration is allowed per branch; always generate migrations and never hand-edit SQL files.',
+        ruleType: 'workflow',
+        appliesWhen: 'When creating database migrations.',
+        avoid: 'hand-editing SQL migration files',
+        prefer: 'generated migrations, one migration per branch',
+        confidence: 0.9,
+        priority: 80,
+        status: 'active',
+      })
+
+      assert.equal(first.reused, false)
+      assert.equal(second.reused, false)
+      assert.notEqual(first.learning.id, second.learning.id)
+      assert.equal(listLearnings(db, runtime.identity.repoKey, 'active').length, 2)
     } finally {
       db.close()
       await rm(storage, { recursive: true, force: true })

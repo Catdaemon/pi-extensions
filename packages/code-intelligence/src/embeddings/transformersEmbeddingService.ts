@@ -8,8 +8,11 @@ import { normalizeVector } from './vector.ts'
 type Extractor = (texts: string[] | string, options?: Record<string, unknown>) => Promise<unknown>
 
 const MODEL_DIMENSIONS: Record<string, number> = {
+  'onnx-community/bge-small-en-v1.5-ONNX': 384,
+  'Xenova/bge-small-en-v1.5': 384,
   'jinaai/jina-embeddings-v2-base-code': 768,
   'onnx-community/granite-embedding-small-english-r2-ONNX': 384,
+  'onnx-community/all-MiniLM-L6-v2-ONNX': 384,
   'Xenova/all-MiniLM-L6-v2': 384,
 }
 
@@ -20,6 +23,11 @@ export class TransformersEmbeddingService implements EmbeddingService {
   status: EmbeddingStatusValue = 'not_started'
   lastError: string | undefined
   activeDevice: string | undefined
+  downloadStatus: string | undefined
+  downloadFile: string | undefined
+  downloadLoadedBytes: number | undefined
+  downloadTotalBytes: number | undefined
+  downloadProgress: number | undefined
 
   private extractor: Extractor | undefined
   private readyPromise: Promise<void> | undefined
@@ -36,7 +44,7 @@ export class TransformersEmbeddingService implements EmbeddingService {
       config.embedding.fallbackModel,
       config.embedding.emergencyFallbackModel,
     ].filter((value, index, array) => Boolean(value) && array.indexOf(value) === index)
-    this.modelId = this.modelIds[0] ?? 'jinaai/jina-embeddings-v2-base-code'
+    this.modelId = this.modelIds[0] ?? 'onnx-community/bge-small-en-v1.5-ONNX'
     this.dimensions = MODEL_DIMENSIONS[this.modelId] ?? 384
     this.cacheDir = resolveModelCacheDir()
   }
@@ -66,7 +74,7 @@ export class TransformersEmbeddingService implements EmbeddingService {
     await this.ensureReady()
     if (!this.extractor) throw new Error('Embedding model is not ready')
 
-    const output = await this.extractor(texts, { pooling: 'mean', normalize: true })
+    const output = await this.extractor(texts, { pooling: poolingForModel(this.modelId), normalize: true })
     return normalizeExtractorOutput(output)
   }
 
@@ -88,16 +96,18 @@ export class TransformersEmbeddingService implements EmbeddingService {
           env.cacheDir = this.cacheDir
 
           this.setStatus('warming')
-          const pipelineOptions: Record<string, unknown> = {
-            cache_dir: this.cacheDir,
+          const pipelineOptions = buildTransformersPipelineOptions({
+            cacheDir: this.cacheDir,
             device,
-          }
-          if (this.config.embedding.dtype !== 'auto') pipelineOptions.dtype = this.config.embedding.dtype
+            dtype: this.config.embedding.dtype,
+            progressCallback: (progress: unknown) => this.updateDownloadProgress(progress),
+          })
           this.extractor = (await transformers.pipeline('feature-extraction', modelId, pipelineOptions)) as Extractor
 
+          this.clearDownloadProgress()
           this.setStatus(index === 0 ? 'ready' : 'fallback_active')
           this.lastError = undefined
-          this.logger.info('embedding model ready', { modelId, dimensions: this.dimensions, cacheDir: this.cacheDir, device })
+          this.logger.info('embedding model ready', { modelId, dimensions: this.dimensions, cacheDir: this.cacheDir, device: this.activeDevice })
           return
         } catch (error) {
           lastError = error
@@ -105,6 +115,7 @@ export class TransformersEmbeddingService implements EmbeddingService {
           this.logger.warn('embedding model/device failed; trying fallback if available', { modelId, device, error: this.lastError })
           this.extractor = undefined
           this.activeDevice = undefined
+          this.clearDownloadProgress()
         }
       }
     }
@@ -117,15 +128,82 @@ export class TransformersEmbeddingService implements EmbeddingService {
     this.status = status
     this.onStatusChange?.(this)
   }
+
+  private updateDownloadProgress(progress: unknown): void {
+    if (!progress || typeof progress !== 'object') return
+    const event = progress as { status?: unknown; name?: unknown; file?: unknown; progress?: unknown; loaded?: unknown; total?: unknown }
+    this.downloadStatus = typeof event.status === 'string' ? event.status : this.downloadStatus
+    this.downloadFile = typeof event.file === 'string' ? event.file : typeof event.name === 'string' ? event.name : this.downloadFile
+    this.downloadLoadedBytes = finiteNumber(event.loaded) ?? this.downloadLoadedBytes
+    this.downloadTotalBytes = finiteNumber(event.total) ?? this.downloadTotalBytes
+    this.downloadProgress = finiteNumber(event.progress) ?? deriveProgress(this.downloadLoadedBytes, this.downloadTotalBytes) ?? this.downloadProgress
+    if (this.downloadStatus === 'download' || this.downloadStatus === 'progress') this.status = 'downloading'
+    this.onStatusChange?.(this)
+  }
+
+  private clearDownloadProgress(): void {
+    this.downloadStatus = undefined
+    this.downloadFile = undefined
+    this.downloadLoadedBytes = undefined
+    this.downloadTotalBytes = undefined
+    this.downloadProgress = undefined
+  }
+}
+
+export function buildTransformersPipelineOptions(input: {
+  cacheDir: string
+  device: string
+  dtype: CodeIntelligenceConfig['embedding']['dtype']
+  progressCallback: (progress: unknown) => void
+}): Record<string, unknown> {
+  const options: Record<string, unknown> = {
+    cache_dir: input.cacheDir,
+    progress_callback: input.progressCallback,
+  }
+  if (input.device !== 'auto') options.device = input.device
+  if (input.dtype !== 'auto') options.dtype = input.dtype
+  return options
 }
 
 export function resolveEmbeddingDeviceCandidates(device: CodeIntelligenceConfig['embedding']['device']): string[] {
   const envOverride = process.env.PI_CODE_INTELLIGENCE_EMBEDDING_DEVICE?.trim().toLowerCase()
   const requested = envOverride || device || 'auto'
   if (requested === 'cpu') return ['cpu']
-  if (requested === 'auto') return ['auto', 'cpu']
-  if (requested === 'gpu') return ['gpu', 'auto', 'cpu']
-  return [requested, 'cpu']
+  if (requested === 'auto') return resolveAutoEmbeddingDeviceCandidates()
+  if (requested === 'gpu') return uniqueDevices(['gpu', ...resolveAutoEmbeddingDeviceCandidates(), 'cpu'])
+  if (requested === 'coreml') return isCoreMlSystemCompatible() ? ['coreml', 'cpu'] : ['cpu']
+  return uniqueDevices([requested, 'cpu'])
+}
+
+export function resolveAutoEmbeddingDeviceCandidates(): string[] {
+  return uniqueDevices([
+    ...(isCoreMlSystemCompatible() ? ['coreml'] : []),
+    'auto',
+    'cpu',
+  ])
+}
+
+function uniqueDevices(devices: string[]): string[] {
+  return devices.filter((device, index, array) => Boolean(device) && array.indexOf(device) === index)
+}
+
+export function isCoreMlSystemCompatible(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.PI_CODE_INTELLIGENCE_DISABLE_COREML === '1') return false
+  if (env.PI_CODE_INTELLIGENCE_FORCE_COREML === '1') return true
+  return process.platform === 'darwin' && process.arch === 'arm64'
+}
+
+export function poolingForModel(modelId: string): 'mean' | 'cls' {
+  return /(?:^|\/)bge-/i.test(modelId) ? 'cls' : 'mean'
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function deriveProgress(loaded: number | undefined, total: number | undefined): number | undefined {
+  if (!loaded || !total || total <= 0) return undefined
+  return Math.max(0, Math.min(100, (loaded / total) * 100))
 }
 
 function normalizeExtractorOutput(output: unknown): number[][] {
