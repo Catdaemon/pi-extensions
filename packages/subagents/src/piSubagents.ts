@@ -28,7 +28,9 @@ const SUBAGENT_INDEX_FILE = join(SUBAGENT_ROOT_DIR, 'index.json')
 const MAX_TASKS = 8
 const MAX_CONCURRENCY = 4
 const PREVIEW_LIMIT = 220
-const RESPONSE_PREVIEW_LIMIT = 160
+// Keep enough child output for the parent agent to aggregate structured JSON results.
+// UI renderers apply their own much smaller truncation where needed.
+const RESPONSE_PREVIEW_LIMIT = 12_000
 const TOOL_UPDATE_THROTTLE_MS = 150
 
 type ContextMode = 'task_only' | 'full_conversation'
@@ -60,6 +62,8 @@ type StoredSubagent = {
   status: SubagentStatus
   lastActivity: string
   lastResponse: string
+  /** Parsed JSON output when the assistant's final response is valid JSON. */
+  outputJson?: unknown
   thinking: boolean
   todoSummary: TodoSummary
   createdAt: number
@@ -175,17 +179,43 @@ function makeTitle(task: string, explicit?: string) {
   return truncatePreview(task, 60) || 'Subagent task'
 }
 
-function extractAssistantText(message: Message | AgentMessage) {
+export function extractAssistantText(message: Message | AgentMessage) {
   if (message.role !== 'assistant') {
     return ''
   }
 
-  const parts = Array.isArray(message.content) ? message.content : []
+  const content = (message as { content?: unknown }).content
+  if (typeof content === 'string') return content.trim()
+
+  const parts = Array.isArray(content) ? content : []
   return parts
-    .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
-    .map((part) => part.text)
+    .map((part) => {
+      if (typeof part === 'string') return part
+      if (!part || typeof part !== 'object') return ''
+      if ('text' in part && typeof part.text === 'string') return part.text
+      if ('content' in part && typeof part.content === 'string') return part.content
+      return ''
+    })
+    .filter(Boolean)
     .join('\n')
     .trim()
+}
+
+export function extractAssistantError(message: Message | AgentMessage): string | undefined {
+  if (message.role !== 'assistant') return undefined
+  const raw = message as { stopReason?: unknown; errorMessage?: unknown }
+  if (raw.stopReason === 'error') return typeof raw.errorMessage === 'string' && raw.errorMessage.trim().length > 0 ? raw.errorMessage : 'Assistant response ended with error.'
+  return undefined
+}
+
+function parseJsonOutput(text: string): unknown {
+  const trimmed = text.trim()
+  if (!trimmed) return undefined
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    return undefined
+  }
 }
 
 function getTodoSummary(todos: TodoItem[], previous?: TodoSummary): TodoSummary {
@@ -353,17 +383,23 @@ function formatSubagentRecord(record: StoredSubagent) {
   return lines.join('\n')
 }
 
-function formatRunResultText(records: StoredSubagent[]) {
+export function formatRunResultText(records: StoredSubagent[]) {
   if (records.length === 0) {
     return 'No subagent results.'
   }
 
   return records
     .map((record) => {
-      const persistence = record.persist === false || record.disposedAt ? 'ephemeral' : 'persistent'
+      const isEphemeral = record.persist === false || record.disposedAt
+      const persistence = isEphemeral ? 'ephemeral (not resumable)' : 'persistent (resumable)'
       const header = `- id: ${record.id} • status: ${record.status} • ${persistence} • title: ${record.title}`
-      const output = record.lastResponse ? truncatePreview(record.lastResponse, RESPONSE_PREVIEW_LIMIT) : '(no response)'
-      return `${header}\n  output: ${output}`
+      const output = record.lastError
+        ? `error: ${truncatePreview(record.lastError, RESPONSE_PREVIEW_LIMIT)}`
+        : record.lastResponse
+          ? truncatePreview(record.lastResponse, RESPONSE_PREVIEW_LIMIT)
+          : '(no response)'
+      const label = record.outputJson !== undefined ? 'outputJson' : 'output'
+      return `${header}\n  ${label}: ${output}`
     })
     .join('\n\n')
 }
@@ -810,10 +846,17 @@ export default function piSubagents(pi: ExtensionAPI) {
           if (message.role === 'assistant') {
             record.thinking = false
             currentAssistantText = ''
-            const text = extractAssistantText(message)
-            if (text) {
-              record.lastResponse = truncatePreview(text, RESPONSE_PREVIEW_LIMIT)
-              record.lastActivity = 'assistant message complete'
+            const error = extractAssistantError(message)
+            if (error) {
+              record.status = 'error'
+              record.lastError = truncatePreview(error, RESPONSE_PREVIEW_LIMIT)
+              record.lastActivity = 'assistant error'
+            } else {
+              const text = extractAssistantText(message)
+              if (text) {
+                record.lastResponse = truncatePreview(text, RESPONSE_PREVIEW_LIMIT)
+                record.lastActivity = 'assistant message complete'
+              }
             }
           }
           if (message.role === 'toolResult') {
@@ -864,8 +907,11 @@ export default function piSubagents(pi: ExtensionAPI) {
       const finalAssistant = [...session.messages].reverse().find((message) => message.role === 'assistant') as
         | Message
         | undefined
+      const finalError = finalAssistant ? extractAssistantError(finalAssistant) : undefined
+      if (finalError) throw new Error(finalError)
       const finalText = finalAssistant ? extractAssistantText(finalAssistant) : ''
       record.lastResponse = truncatePreview(finalText, RESPONSE_PREVIEW_LIMIT)
+      record.outputJson = parseJsonOutput(finalText)
       record.lastActivity = 'completed'
       record.status = 'completed'
       record.thinking = false
@@ -1055,7 +1101,7 @@ export default function piSubagents(pi: ExtensionAPI) {
                   : theme.fg('accent', '↻')
           return [
             `${statusIcon} ${theme.fg('accent', record.id)} ${theme.fg('text', record.title)}`,
-            theme.fg('muted', `  ${truncatePreview(record.lastResponse || record.lastActivity || '(no output)', 120)}`),
+            theme.fg('muted', `  ${truncatePreview(record.lastError ? `error: ${record.lastError}` : record.lastResponse || record.lastActivity || '(no output)', 120)}`),
           ]
         })
         return new Text(lines.join('\n'), 0, 0)
@@ -1127,7 +1173,7 @@ export default function piSubagents(pi: ExtensionAPI) {
       }
       const existing = await lookupStoredSubagent(params.id, knownSubagents)
       if (!existing) {
-        throw new Error(`Unknown subagent id: ${params.id}`)
+        throw new Error(`Unknown subagent id: ${params.id}. It may have been created with persist=false, which makes it ephemeral and not resumable. Use the captured subagent_run output or rerun the task with persist=true if you need to resume it.`)
       }
 
       const record: StoredSubagent = {
